@@ -15,12 +15,14 @@ pub mod config;
 pub mod connect;
 pub mod screen;
 pub mod usb;
+pub mod verify;
 pub mod wsconn;
 
 pub use clipboard::{run_clipboard, ClipboardBackend, ClipboardConfig};
 pub use connect::{register, RegisterConfig, Registration};
 pub use screen::{InputHandle, Screen};
 pub use usb::{UsbConfig, UsbSession};
+pub use verify::{run_verify, VerifyConfig};
 
 // Re-exports so frontends/CLIs depend only on this crate.
 pub use pcsuite_proto::input::{MouseAction, MouseButton};

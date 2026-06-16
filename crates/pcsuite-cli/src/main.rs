@@ -22,8 +22,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    config, register, run_clipboard, usb, ClipboardBackend, ClipboardConfig, RegisterConfig, Screen,
-    ScreenParams, UsbConfig,
+    config, register, run_clipboard, run_verify, usb, ClipboardBackend, ClipboardConfig,
+    RegisterConfig, Screen, ScreenParams, UsbConfig, VerifyConfig,
 };
 
 struct Args {
@@ -93,7 +93,8 @@ fn print_help() {
          pcsuite screen --usb [--seconds <N>] [--out <file.h265>]\n  \
          pcsuite screen --phone <IP> [--reg-ip <IP>] [--data-ip <IP>] [--remote] \
          [--seconds <N>] [--out <file.h265>] [--input-test]\n  \
-         pcsuite clipboard --usb [--seconds <N>]   (text sync; --seconds 0 = forever)\n\n\
+         pcsuite clipboard --usb [--seconds <N>]   (text sync; --seconds 0 = forever)\n  \
+         pcsuite verify-code --usb [--seconds <N>] (SMS code relay → clipboard)\n\n\
          Gets a token onto the phone (USB adb, or LAN ConnectFlow), opens the\n\
          screen-mirror data plane, and counts frames (or dumps raw HEVC with --out).\n\
          --input-test scrolls the phone centre to verify mouse/scroll injection."
@@ -114,6 +115,7 @@ async fn main() -> Result<()> {
     match args.cmd.as_str() {
         "screen" => cmd_screen(args).await,
         "clipboard" => cmd_clipboard(args).await,
+        "verify-code" => cmd_verify(args).await,
         "" | "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -301,5 +303,49 @@ impl ClipboardBackend for MacClipboard {
         }
         child.wait()?;
         Ok(())
+    }
+}
+
+async fn cmd_verify(args: Args) -> Result<()> {
+    if !args.usb {
+        anyhow::bail!("`verify-code` currently supports --usb only");
+    }
+    tracing::info!("pcsuite verify-code — USB (adb) mode");
+    let session = usb::prepare(UsbConfig::default()).await?;
+    let cfg = VerifyConfig {
+        data_ip: "127.0.0.1".into(),
+        token: session.token.clone(),
+    };
+    println!("🔑 verify-code relay running — receive an SMS code on the phone; it'll be copied to the Mac clipboard. Ctrl-C to stop.");
+    let run = run_verify(cfg, |code, sign| {
+        println!("★ SMS code: {code}  (from: {sign})");
+        copy_to_clipboard(code);
+    });
+    let seconds = args.seconds.unwrap_or(0.0);
+    let result = if seconds > 0.0 {
+        match tokio::time::timeout(Duration::from_secs_f64(seconds), run).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::info!("verify-code: time limit reached");
+                Ok(())
+            }
+        }
+    } else {
+        run.await
+    };
+    usb::cleanup(&session.adb).await;
+    result
+}
+
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    if let Ok(mut child) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
     }
 }

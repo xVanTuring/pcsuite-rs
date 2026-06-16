@@ -299,7 +299,7 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
         (sh.phone_key.clone(), sh.phone_iv.clone())
     };
     let (Some(pk), Some(piv)) = (phone_key, phone_iv) else {
-        tracing::info!(byte_c = frame.byte_c, "8904 frame in (no phone key yet)");
+        tracing::debug!(byte_c = frame.byte_c, "8904 frame (no phone key yet)");
         return;
     };
     let plain = match gcm_decrypt(&frame.cipher, pk.as_bytes(), piv.as_bytes(), b"") {
@@ -310,8 +310,12 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
         }
     };
     let text = String::from_utf8_lossy(&plain);
-    let dbg: String = text.chars().take(90).collect();
-    tracing::info!(byte_c = frame.byte_c, len = plain.len(), content = %dbg, "← 8904 frame");
+    tracing::debug!(
+        byte_c = frame.byte_c,
+        len = plain.len(),
+        content = %text.chars().take(90).collect::<String>(),
+        "8904 frame in"
+    );
 
     match frame.byte_c {
         2 => {

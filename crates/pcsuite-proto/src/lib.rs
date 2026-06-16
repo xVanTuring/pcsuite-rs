@@ -18,6 +18,7 @@ pub mod input;
 pub mod payload1;
 pub mod ruying;
 pub mod screen;
+pub mod verify;
 
 pub use connect::PcIdentity;
 
