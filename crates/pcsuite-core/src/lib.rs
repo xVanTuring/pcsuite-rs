@@ -16,6 +16,7 @@ pub mod connect;
 pub mod screen;
 pub mod session;
 pub mod usb;
+pub mod vdfs;
 pub mod verify;
 pub mod wsconn;
 

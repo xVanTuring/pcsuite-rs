@@ -171,6 +171,77 @@ fn gcm_setup<'a>(
     Ok((cipher, nonce))
 }
 
+// ───────────────────────────── vdfs (AES-256-GCM, 12-byte nonce) ─────────────────────────────
+//
+// The vdfs file planes (5678 fetch / 5679 serve) use *standard* AES-256-GCM with a
+// 12-byte nonce (`iv[..12]`), no AAD. Requests carry a real tag the phone verifies,
+// but the frame puts the tag *before* the ciphertext, so callers seal and frame
+// separately ([`gcm12_seal`] returns `(ciphertext, tag)`). Responses are read back
+// as a raw stream — the phone's binaries skip tag verification, decrypting with just
+// key+nonce, so [`gcm12_open_noauth`] does CTR decryption and never authenticates.
+
+use aes::cipher::StreamCipher; // `KeyIvInit` is already in scope from the cbc import above
+use aes_gcm::aead::generic_array::typenum::U12;
+
+/// Standard AES-256-GCM with a 12-byte nonce and 16-byte tag — vdfs's primitive.
+type Gcm12 = AesGcm<Aes256, U12, U16>;
+
+/// CTR variant used to decrypt vdfs responses without authenticating the tag. GCM's
+/// ciphertext keystream starts at counter block `J0 + 1`; for a 96-bit nonce
+/// `J0 = nonce ‖ 0x00000001`, so the first block uses `nonce ‖ 0x00000002`.
+type Aes256Ctr32BE = ctr::Ctr32BE<Aes256>;
+
+fn gcm12_nonce(iv: &[u8]) -> Result<[u8; 12], CryptoError> {
+    if iv.len() < 12 {
+        return Err(CryptoError::BadLength("iv < 12"));
+    }
+    let mut n = [0u8; 12];
+    n.copy_from_slice(&iv[..12]);
+    Ok(n)
+}
+
+fn gcm12_key(key: &[u8]) -> Result<[u8; 32], CryptoError> {
+    if key.len() < 32 {
+        return Err(CryptoError::BadLength("key < 32"));
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&key[..32]);
+    Ok(k)
+}
+
+/// vdfs "seal": AES-256-GCM (12-byte nonce, no AAD). Returns `(ciphertext, tag16)`
+/// so the caller can frame them tag-first (vdfs puts the tag before the ciphertext).
+/// `key` is truncated to 32 bytes and `iv` to 12, matching the Python reference.
+pub fn gcm12_seal(plain: &[u8], key: &[u8], iv: &[u8]) -> Result<(Vec<u8>, [u8; 16]), CryptoError> {
+    let k = gcm12_key(key)?;
+    let n = gcm12_nonce(iv)?;
+    let cipher = Gcm12::new(GenericArray::from_slice(&k));
+    let mut blob = cipher
+        .encrypt(GenericArray::from_slice(&n), Payload { msg: plain, aad: b"" })
+        .map_err(|_| CryptoError::Crypt)?;
+    // aes-gcm appends the 16-byte tag; split it off.
+    let tag_start = blob.len() - 16;
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&blob[tag_start..]);
+    blob.truncate(tag_start);
+    Ok((blob, tag))
+}
+
+/// vdfs "open" WITHOUT authentication: CTR-decrypt `ciphertext` (tag skipped) with a
+/// 12-byte nonce — GCM is a stream cipher, so key+nonce alone recover the plaintext.
+/// Matches the phone-suite binaries, which never verify the response tag.
+pub fn gcm12_open_noauth(ciphertext: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let k = gcm12_key(key)?;
+    let n = gcm12_nonce(iv)?;
+    let mut counter = [0u8; 16];
+    counter[..12].copy_from_slice(&n);
+    counter[15] = 2; // J0 + 1 = nonce ‖ 0x00000002
+    let mut buf = ciphertext.to_vec();
+    let mut ctr = Aes256Ctr32BE::new(GenericArray::from_slice(&k), GenericArray::from_slice(&counter));
+    ctr.apply_keystream(&mut buf);
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +313,27 @@ mod tests {
         let last = blob.len() - 1;
         blob[last] ^= 0xff;
         assert_eq!(gcm_decrypt(&blob, &key, &iv, b""), Err(CryptoError::Crypt));
+    }
+
+    #[test]
+    fn gcm12_kat_and_noauth_roundtrip() {
+        // KAT from the Python `cryptography` reference (AESGCM, 12-byte nonce).
+        // iv passed as 16 bytes; only the first 12 are used.
+        let key: Vec<u8> = (0u8..32).collect();
+        let iv: Vec<u8> = (0u8..16).collect();
+        let pt = b"vivo vdfs frame test";
+
+        let (ct, tag) = gcm12_seal(pt, &key, &iv).unwrap();
+        assert_eq!(hex::encode(&ct), "316ba074e593a67dfe61f1f9d0841d4df7b3f440");
+        assert_eq!(hex::encode(tag), "efc9f0cc0ebf8b6fd36c018d24dc7b55");
+
+        // no-auth CTR decrypt of the ciphertext recovers the plaintext (tag ignored).
+        let back = gcm12_open_noauth(&ct, &key, &iv).unwrap();
+        assert_eq!(back, pt);
+
+        // empty plaintext -> empty ciphertext, tag only.
+        let (ect, etag) = gcm12_seal(b"", &key, &iv).unwrap();
+        assert!(ect.is_empty());
+        assert_eq!(hex::encode(etag), "f4c2db1dc38805a37b92171c5d0a81cc");
     }
 }

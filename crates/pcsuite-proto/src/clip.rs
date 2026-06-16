@@ -121,6 +121,57 @@ pub fn clip_text_from_json(text: &str) -> Option<String> {
     }
 }
 
+/// Clipboard content JSON for an image *reference* (`type:4`): the bytes are not
+/// inlined — `items[0].path` points the peer at a vdfs path to fetch. `path` is the
+/// platform path the *peer's* vdfs server will read (Windows-style backslashes for a
+/// PC-served file).
+pub fn clip_image_ref_json(
+    pc_id: &str,
+    device_name: &str,
+    nick: &str,
+    path: &str,
+    mime: &str,
+    ts_ms: u64,
+) -> String {
+    json!({
+        "callingapk": "com.vivo.pcsuite",
+        "deviceid": pc_id,
+        "devicename": device_name,
+        "devicetype": 64,
+        "flag": "",
+        "items": [{"text": "", "htmltext": "", "path": path, "uri": ""}],
+        "lable": "",
+        "mimetypes": [mime],
+        "nickname": nick,
+        "timestamp": ts_ms,
+        "type": 4
+    })
+    .to_string()
+}
+
+/// An image reference parsed from an incoming clipboard JSON: the path to fetch
+/// over vdfs and its declared mime type.
+pub struct ImageRef {
+    pub path: String,
+    pub mime: String,
+}
+
+/// Extract an image reference (`items[0].path` + an `image/*` mimetype) from a
+/// content JSON, if present. Returns `None` for plain-text clipboards.
+pub fn clip_image_from_json(text: &str) -> Option<ImageRef> {
+    let j: Value = serde_json::from_str(text).ok()?;
+    let path = j.get("items")?.as_array()?.first()?.get("path")?.as_str()?;
+    if path.is_empty() {
+        return None;
+    }
+    let mimes = j.get("mimetypes")?.as_array()?;
+    let mime = mimes
+        .iter()
+        .filter_map(|m| m.as_str())
+        .find(|m| m.contains("image"))?;
+    Some(ImageRef { path: path.to_string(), mime: mime.to_string() })
+}
+
 /// 8904 command-frame payloads (byteC=100): announce + request-clipboard.
 pub fn command_announce(pc_id: &str) -> String {
     json!({"command": 1, "deviceId": pc_id}).to_string()
@@ -168,5 +219,23 @@ mod tests {
         // empty text -> None
         let e = clip_text_json("pc0000", "mac", "nick", "", 0);
         assert!(clip_text_from_json(&e).is_none());
+    }
+
+    #[test]
+    fn clip_image_ref_roundtrip() {
+        let path = r"\Users\me\Library\Caches\pcsuite\img.jpeg";
+        let j = clip_image_ref_json("pc0000", "mac", "nick", path, "image/jpeg", 99);
+        // an image ref is not text
+        assert!(clip_text_from_json(&j).is_none());
+        let r = clip_image_from_json(&j).expect("image ref");
+        assert_eq!(r.path, path);
+        assert_eq!(r.mime, "image/jpeg");
+        // a phone-side reference (forward-slash path) parses too
+        let phone = r#"{"items":[{"text":"","path":"/storage/emulated/0/DCIM/x.jpg"}],"mimetypes":["image/jpeg"],"type":4}"#;
+        let r2 = clip_image_from_json(phone).unwrap();
+        assert_eq!(r2.path, "/storage/emulated/0/DCIM/x.jpg");
+        // a text clipboard yields no image ref
+        let t = clip_text_json("pc0000", "mac", "nick", "hello", 0);
+        assert!(clip_image_from_json(&t).is_none());
     }
 }

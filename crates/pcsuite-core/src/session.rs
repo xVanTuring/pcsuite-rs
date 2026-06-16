@@ -115,13 +115,24 @@ impl Session {
         backend: Arc<dyn ClipboardBackend>,
     ) -> Result<()> {
         let (pc_key, pc_iv) = clipboard::rand_clip_keys();
-        let shared = clipboard::new_shared(pc_key.clone(), pc_iv.clone());
+        let shared = clipboard::new_shared(
+            pc_key.clone(),
+            pc_iv.clone(),
+            cfg.vdfs_fetch_host.clone(),
+            cfg.vdfs_fetch_port,
+        );
         let listener = TcpListener::bind(format!("{}:8904", cfg.bind_addr))
             .await
             .with_context(|| format!("bind {}:8904", cfg.bind_addr))?;
         tracing::info!(bind = %cfg.bind_addr, "8904 relay listening");
         self.tasks
             .push(clipboard::spawn_8904_server(listener, shared.clone(), backend.clone()));
+
+        // 5679 vdfs server (phone fetches PC images here; PC→phone paste)
+        match clipboard::start_vdfs_server(&cfg.bind_addr, &pc_key, &pc_iv).await {
+            Ok(task) => self.tasks.push(task),
+            Err(e) => tracing::warn!(err = %e, "vdfs 5679 server unavailable (PC→phone images off)"),
+        }
         self.tasks
             .push(clipboard::spawn_watcher(shared.clone(), backend, cfg.device_name.clone()));
 

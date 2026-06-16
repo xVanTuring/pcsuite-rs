@@ -22,6 +22,8 @@ sha1 = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc", "block-padding"] }
 aes-gcm = "0.10"
+# raw CTR mode for vdfs's no-auth GCM decryption (responses decrypt key+nonce only)
+ctr = "0.9"
 hex = "0.4"
 # async / net (added in later milestones)
 tokio = { version = "1", features = ["full"] }

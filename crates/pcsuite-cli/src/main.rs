@@ -262,8 +262,7 @@ async fn cmd_clipboard(args: Args) -> Result<()> {
     let identity = config::default_identity();
     tracing::info!("pcsuite clipboard — USB (adb) mode");
     let session = usb::prepare(UsbConfig::default()).await?;
-    // let the phone reach our 8904 relay via its own localhost
-    pcsuite_core::adb::run_ok(&session.adb, &["reverse", "tcp:8904", "tcp:8904"]).await;
+    setup_clipboard_forwards(&session.adb).await;
 
     let cfg = ClipboardConfig {
         data_ip: "127.0.0.1".into(),
@@ -273,10 +272,12 @@ async fn cmd_clipboard(args: Args) -> Result<()> {
         open_id: identity.open_id.clone(),
         device_name: identity.device_name.clone(),
         connect_type: "USB".into(),
+        vdfs_fetch_host: "127.0.0.1".into(),
+        vdfs_fetch_port: 10382,
     };
     let backend: Arc<dyn ClipboardBackend> = Arc::new(MacClipboard);
 
-    println!("📋 clipboard relay running — copy text on Mac or phone to sync. Ctrl-C to stop.");
+    println!("📋 clipboard relay running — copy text or an image on Mac or phone to sync. Ctrl-C to stop.");
     let run = run_clipboard(cfg, backend);
     let seconds = args.seconds.unwrap_or(0.0); // clipboard default: run forever
     let result = if seconds > 0.0 {
@@ -291,12 +292,28 @@ async fn cmd_clipboard(args: Args) -> Result<()> {
         run.await
     };
 
-    pcsuite_core::adb::run_ok(&session.adb, &["reverse", "--remove", "tcp:8904"]).await;
+    teardown_clipboard_forwards(&session.adb).await;
     usb::cleanup(&session.adb).await;
     result
 }
 
-/// macOS clipboard backend via `pbpaste`/`pbcopy`.
+/// Wire up the USB port plumbing the clipboard relay needs:
+/// - reverse 8904: phone reverse-connects to our 8904 relay
+/// - reverse 5679: phone fetches PC images from our vdfs server (PC→phone paste)
+/// - forward 10382→5678: we fetch phone images from its vdfs server (phone→PC paste)
+async fn setup_clipboard_forwards(adb: &str) {
+    pcsuite_core::adb::run_ok(adb, &["reverse", "tcp:8904", "tcp:8904"]).await;
+    pcsuite_core::adb::run_ok(adb, &["reverse", "tcp:5679", "tcp:5679"]).await;
+    pcsuite_core::adb::run_ok(adb, &["forward", "tcp:10382", "tcp:5678"]).await;
+}
+
+async fn teardown_clipboard_forwards(adb: &str) {
+    pcsuite_core::adb::run_ok(adb, &["reverse", "--remove", "tcp:8904"]).await;
+    pcsuite_core::adb::run_ok(adb, &["reverse", "--remove", "tcp:5679"]).await;
+    pcsuite_core::adb::run_ok(adb, &["forward", "--remove", "tcp:10382"]).await;
+}
+
+/// macOS clipboard backend via `pbpaste`/`pbcopy` (text) and `osascript` (images).
 struct MacClipboard;
 
 impl ClipboardBackend for MacClipboard {
@@ -314,6 +331,61 @@ impl ClipboardBackend for MacClipboard {
             stdin.write_all(text.as_bytes())?;
         }
         child.wait()?;
+        Ok(())
+    }
+
+    fn image_signature(&self) -> Option<String> {
+        // `clipboard info` is cheap and changes with the image; gate on an image class.
+        let out = std::process::Command::new("osascript")
+            .args(["-e", "clipboard info"])
+            .output()
+            .ok()?;
+        let info = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let is_image = ["picture", "PNGf", "TIFF", "8BPS", "JPEG"]
+            .iter()
+            .any(|k| info.contains(k));
+        is_image.then_some(info)
+    }
+
+    fn get_image(&self) -> Option<Vec<u8>> {
+        // Coerce the clipboard to JPEG, write to a temp file, read it back. Fails
+        // (→ None) when the clipboard holds no image.
+        let dest = std::env::temp_dir().join("pcsuite_clip_get.jpeg");
+        let dest_s = dest.to_string_lossy();
+        let script = format!(
+            "set d to (the clipboard as JPEG picture)\n\
+             set f to (open for access (POSIX file \"{dest_s}\") with write permission)\n\
+             set eof f to 0\nwrite d to f\nclose access f"
+        );
+        let ok = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()
+            .ok()
+            .is_some_and(|o| o.status.success());
+        if !ok {
+            return None;
+        }
+        std::fs::read(&dest).ok().filter(|b| !b.is_empty())
+    }
+
+    fn set_image(&self, data: &[u8], mime: &str) -> Result<()> {
+        let (ext, class) = match mime {
+            "image/png" => ("png", "«class PNGf»"),
+            "image/gif" => ("gif", "GIF picture"),
+            "image/tiff" => ("tiff", "TIFF picture"),
+            "image/bmp" => ("bmp", "«class BMP »"),
+            _ => ("jpeg", "JPEG picture"),
+        };
+        let path = std::env::temp_dir().join(format!("pcsuite_clip_set.{ext}"));
+        std::fs::write(&path, data)?;
+        let path_s = path.to_string_lossy();
+        let script = format!("set the clipboard to (read (POSIX file \"{path_s}\") as {class})");
+        let out = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("osascript set image: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
         Ok(())
     }
 }
@@ -379,7 +451,7 @@ async fn cmd_all(args: Args) -> Result<()> {
 
     let usb_session = usb::prepare(UsbConfig::default()).await?;
     if do_clip {
-        pcsuite_core::adb::run_ok(&usb_session.adb, &["reverse", "tcp:8904", "tcp:8904"]).await;
+        setup_clipboard_forwards(&usb_session.adb).await;
     }
 
     let mut session = Session::connect("127.0.0.1", &usb_session.token).await?;
@@ -399,6 +471,8 @@ async fn cmd_all(args: Args) -> Result<()> {
             open_id: identity.open_id.clone(),
             device_name: identity.device_name.clone(),
             connect_type: "USB".into(),
+            vdfs_fetch_host: "127.0.0.1".into(),
+            vdfs_fetch_port: 10382,
         };
         session.enable_clipboard(cfg, Arc::new(MacClipboard)).await?;
     }
@@ -460,7 +534,7 @@ async fn cmd_all(args: Args) -> Result<()> {
 
     drop(session); // aborts all feature tasks
     if do_clip {
-        pcsuite_core::adb::run_ok(&usb_session.adb, &["reverse", "--remove", "tcp:8904"]).await;
+        teardown_clipboard_forwards(&usb_session.adb).await;
     }
     usb::cleanup(&usb_session.adb).await;
     result

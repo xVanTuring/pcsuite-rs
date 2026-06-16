@@ -10,4 +10,5 @@ sha2.workspace = true
 aes.workspace = true
 cbc.workspace = true
 aes-gcm.workspace = true
+ctr.workspace = true
 hex.workspace = true

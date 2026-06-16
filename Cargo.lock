@@ -475,6 +475,7 @@ dependencies = [
  "aes",
  "aes-gcm",
  "cbc",
+ "ctr",
  "hex",
  "sha2",
 ]

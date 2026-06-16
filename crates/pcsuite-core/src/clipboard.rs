@@ -29,16 +29,34 @@ use pcsuite_proto::ruying::{self, Parsed, RuyingFrame};
 
 use crate::config;
 use crate::session::ControlHandle;
+use crate::vdfs;
 use crate::wsconn::open_ws;
 
 const ECHO_WINDOW: Duration = Duration::from_secs(6);
 
 /// OS clipboard access, supplied by the frontend so the core stays portable.
+///
+/// Text is mandatory; the image methods are optional (default to "unsupported")
+/// so a text-only backend keeps working and image sync just stays off.
 pub trait ClipboardBackend: Send + Sync {
     /// Current clipboard text (`None` if empty / non-text).
     fn get_text(&self) -> Option<String>;
     /// Replace the clipboard text.
     fn set_text(&self, text: &str) -> Result<()>;
+    /// A cheap fingerprint of the current clipboard image, or `None` if the
+    /// clipboard holds no image. Used to detect *changes* without extracting the
+    /// (possibly multi-megabyte) bytes every poll.
+    fn image_signature(&self) -> Option<String> {
+        None
+    }
+    /// Extract the current clipboard image as encoded bytes (e.g. JPEG).
+    fn get_image(&self) -> Option<Vec<u8>> {
+        None
+    }
+    /// Put an encoded image (with a mime hint like `"image/jpeg"`) on the clipboard.
+    fn set_image(&self, _data: &[u8], _mime: &str) -> Result<()> {
+        anyhow::bail!("image clipboard not supported by this backend")
+    }
 }
 
 /// Where to run the clipboard relay.
@@ -55,6 +73,11 @@ pub struct ClipboardConfig {
     pub device_name: String,
     /// `"USB"` or `"WLAN"`.
     pub connect_type: String,
+    /// Host the phone's vdfs server is reachable at for image *fetch* (phone→PC).
+    /// USB: `127.0.0.1` (adb-forwarded). LAN: the phone IP.
+    pub vdfs_fetch_host: String,
+    /// Port for the above. USB: `10382` (forward→phone 5678). LAN: `5678`.
+    pub vdfs_fetch_port: u16,
 }
 
 pub(crate) struct Shared {
@@ -66,6 +89,15 @@ pub(crate) struct Shared {
     outgoing: Option<mpsc::Sender<Vec<u8>>>,
     last_text: Option<String>,
     recent: HashMap<String, Instant>,
+    // ── image plane (vdfs) ──
+    /// Where to reach the phone's vdfs server (host, port) for image fetch.
+    fetch_host: String,
+    fetch_port: u16,
+    /// Last phone image path we fetched (suppress refetch on repeated refs).
+    last_image_ref: Option<String>,
+    /// Signature of the clipboard image we last handled in *either* direction
+    /// (suppress bouncing a just-received image back to the phone).
+    last_image_sig: Option<String>,
 }
 
 impl Shared {
@@ -128,22 +160,18 @@ fn preview(s: &str) -> String {
 pub async fn run_clipboard(cfg: ClipboardConfig, backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     let pc_key = rand_chars(32);
     let pc_iv = rand_chars(16);
-    let shared: SharedRef = Arc::new(Mutex::new(Shared {
-        pc_key: pc_key.clone(),
-        pc_iv: pc_iv.clone(),
-        phone_key: None,
-        phone_iv: None,
-        phone_id: "52467a".into(),
-        outgoing: None,
-        last_text: None,
-        recent: HashMap::new(),
-    }));
+    let shared = new_shared(pc_key.clone(), pc_iv.clone(), cfg.vdfs_fetch_host.clone(), cfg.vdfs_fetch_port);
 
     // 8904 relay server (phone reverse-connects here)
     let listener = TcpListener::bind(format!("{}:8904", cfg.bind_addr))
         .await
         .with_context(|| format!("bind {}:8904", cfg.bind_addr))?;
     tracing::info!(bind = %cfg.bind_addr, "8904 relay listening");
+
+    // 5679 vdfs server (phone fetches PC images here; PC→phone paste)
+    if let Err(e) = start_vdfs_server(&cfg.bind_addr, &pc_key, &pc_iv).await {
+        tracing::warn!(err = %e, "vdfs 5679 server unavailable (PC→phone images off)");
+    }
     {
         let shared = shared.clone();
         let backend = backend.clone();
@@ -339,6 +367,21 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
                     let _ = tokio::task::spawn_blocking(move || backend.set_text(&t)).await;
                     tracing::info!(text = %preview(&clip_text), "[phone→PC] clipboard text → OS clipboard");
                 }
+            } else if let Some(img) = clip::clip_image_from_json(&text) {
+                // Image clipboard: the frame carries only a path; pull the bytes over
+                // vdfs and drop them on the OS clipboard. Done off the 8904 read loop.
+                let proceed = {
+                    let mut sh = shared.lock().await;
+                    if sh.last_image_ref.as_deref() == Some(img.path.as_str()) {
+                        false
+                    } else {
+                        sh.last_image_ref = Some(img.path.clone());
+                        true
+                    }
+                };
+                if proceed {
+                    tokio::spawn(fetch_image_task(img, shared.clone(), backend.clone()));
+                }
             }
         }
         100 => tracing::debug!(cmd = %preview(&text), "[phone] command frame"),
@@ -346,14 +389,55 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
     }
 }
 
-/// Poll the OS clipboard and forward changes to the phone (PC -> phone).
+/// Fetch a phone image referenced by an 8904 frame and put it on the OS clipboard.
+async fn fetch_image_task(img: clip::ImageRef, shared: SharedRef, backend: Arc<dyn ClipboardBackend>) {
+    let (pk, piv, pid, host, port) = {
+        let sh = shared.lock().await;
+        (sh.phone_key.clone(), sh.phone_iv.clone(), sh.phone_id.clone(), sh.fetch_host.clone(), sh.fetch_port)
+    };
+    let (Some(pk), Some(piv)) = (pk, piv) else {
+        tracing::warn!("image ref but no phone key yet; skipping fetch");
+        return;
+    };
+    let bytes = match vdfs::fetch(&host, port, &pk, &piv, &pid, &img.path).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(err = %e, path = %img.path, "[phone→PC] image fetch failed");
+            return;
+        }
+    };
+    let n = bytes.len();
+    let mime = mime_from_path(&img.path).to_string();
+    let b = backend.clone();
+    let set = tokio::task::spawn_blocking(move || b.set_image(&bytes, &mime)).await;
+    match set {
+        Ok(Ok(())) => {
+            // record the resulting clipboard signature so the watcher won't bounce it back
+            let b2 = backend.clone();
+            if let Ok(Some(sig)) = tokio::task::spawn_blocking(move || b2.image_signature()).await {
+                shared.lock().await.last_image_sig = Some(sig);
+            }
+            tracing::info!(path = %img.path, bytes = n, "[phone→PC] image → OS clipboard");
+        }
+        Ok(Err(e)) => tracing::warn!(err = %e, "[phone→PC] set_image failed"),
+        Err(e) => tracing::warn!(err = %e, "[phone→PC] set_image task join failed"),
+    }
+}
+
+/// Poll the OS clipboard and forward changes to the phone (PC -> phone). Text is
+/// sent inline; an image is staged to a temp file and sent as a vdfs reference (the
+/// phone then fetches it from our 5679 server).
 async fn watcher(shared: SharedRef, backend: Arc<dyn ClipboardBackend>, device_name: String) {
-    // seed last_text so we don't immediately resend whatever is already there
-    if let Ok(Some(cur)) = {
+    // seed last_text/image so we don't immediately resend whatever is already there
+    {
         let b = backend.clone();
-        tokio::task::spawn_blocking(move || b.get_text()).await
-    } {
-        shared.lock().await.last_text = Some(cur);
+        if let Ok(Some(cur)) = tokio::task::spawn_blocking(move || b.get_text()).await {
+            shared.lock().await.last_text = Some(cur);
+        }
+        let b = backend.clone();
+        if let Ok(sig) = tokio::task::spawn_blocking(move || b.image_signature()).await {
+            shared.lock().await.last_image_sig = sig;
+        }
     }
 
     loop {
@@ -362,35 +446,91 @@ async fn watcher(shared: SharedRef, backend: Arc<dyn ClipboardBackend>, device_n
             let b = backend.clone();
             tokio::task::spawn_blocking(move || b.get_text()).await.ok().flatten()
         };
-        let Some(cur) = cur else { continue };
-        if cur.is_empty() {
+        let cur = cur.unwrap_or_default();
+
+        if !cur.is_empty() {
+            // ── text ──
+            let to_send = {
+                let mut sh = shared.lock().await;
+                if sh.outgoing.is_none()
+                    || sh.last_text.as_deref() == Some(cur.as_str())
+                    || sh.recently_synced(&cur)
+                {
+                    None
+                } else {
+                    sh.last_text = Some(cur.clone());
+                    sh.mark(&cur);
+                    let json =
+                        clip::clip_text_json(config::CLIP_PC_ID, &device_name, config::CLIP_NICK, &cur, now_ms());
+                    match build_frame(json.as_bytes(), &sh.pc_key, &sh.pc_iv, &sh.phone_id, config::CLIP_PC_ID, 2) {
+                        Ok(frame) => sh.outgoing.clone().map(|tx| (tx, frame)),
+                        Err(e) => {
+                            tracing::warn!(err = %e, "build clipboard frame");
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some((tx, frame)) = to_send {
+                let _ = tx.send(frame).await;
+                tracing::info!(text = %preview(&cur), "[PC→phone] clipboard text");
+            }
             continue;
         }
 
-        // build the outgoing frame under the lock, send after releasing it
+        // ── image (text empty) ── only bother extracting bytes when the cheap
+        // signature shows a *new* image and a phone is connected.
+        let sig = {
+            let b = backend.clone();
+            tokio::task::spawn_blocking(move || b.image_signature()).await.ok().flatten()
+        };
+        let Some(sig) = sig else { continue };
+        let fresh = {
+            let sh = shared.lock().await;
+            sh.outgoing.is_some() && sh.last_image_sig.as_deref() != Some(sig.as_str())
+        };
+        if !fresh {
+            continue;
+        }
+        let bytes = {
+            let b = backend.clone();
+            tokio::task::spawn_blocking(move || b.get_image()).await.ok().flatten()
+        };
+        let Some(bytes) = bytes else {
+            // mark seen anyway so we don't retry a non-extractable image every 700ms
+            shared.lock().await.last_image_sig = Some(sig);
+            continue;
+        };
+        let macpath = match write_clip_image(&bytes, now_ms()) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(err = %e, "stage clipboard image failed");
+                continue;
+            }
+        };
+        let backslash = macpath.replace('/', "\\");
         let to_send = {
             let mut sh = shared.lock().await;
-            if sh.outgoing.is_none()
-                || sh.last_text.as_deref() == Some(cur.as_str())
-                || sh.recently_synced(&cur)
-            {
-                None
-            } else {
-                sh.last_text = Some(cur.clone());
-                sh.mark(&cur);
-                let json = clip::clip_text_json(config::CLIP_PC_ID, &device_name, config::CLIP_NICK, &cur, now_ms());
-                match build_frame(json.as_bytes(), &sh.pc_key, &sh.pc_iv, &sh.phone_id, config::CLIP_PC_ID, 2) {
-                    Ok(frame) => sh.outgoing.clone().map(|tx| (tx, frame)),
-                    Err(e) => {
-                        tracing::warn!(err = %e, "build clipboard frame");
-                        None
-                    }
+            sh.last_image_sig = Some(sig);
+            let json = clip::clip_image_ref_json(
+                config::CLIP_PC_ID,
+                &device_name,
+                config::CLIP_NICK,
+                &backslash,
+                "image/jpeg",
+                now_ms(),
+            );
+            match build_frame(json.as_bytes(), &sh.pc_key, &sh.pc_iv, &sh.phone_id, config::CLIP_PC_ID, 2) {
+                Ok(frame) => sh.outgoing.clone().map(|tx| (tx, frame)),
+                Err(e) => {
+                    tracing::warn!(err = %e, "build image-ref frame");
+                    None
                 }
             }
         };
         if let Some((tx, frame)) = to_send {
             let _ = tx.send(frame).await;
-            tracing::info!(text = %preview(&cur), "[PC→phone] clipboard text");
+            tracing::info!(bytes = bytes.len(), path = %macpath, "[PC→phone] clipboard image (ref → 5679 serve)");
         }
     }
 }
@@ -402,8 +542,9 @@ pub(crate) fn rand_clip_keys() -> (String, String) {
     (rand_chars(32), rand_chars(16))
 }
 
-/// Build the shared relay state.
-pub(crate) fn new_shared(pc_key: String, pc_iv: String) -> SharedRef {
+/// Build the shared relay state. `fetch_host`/`fetch_port` locate the phone's vdfs
+/// server for image fetch (phone→PC).
+pub(crate) fn new_shared(pc_key: String, pc_iv: String, fetch_host: String, fetch_port: u16) -> SharedRef {
     Arc::new(Mutex::new(Shared {
         pc_key,
         pc_iv,
@@ -413,7 +554,42 @@ pub(crate) fn new_shared(pc_key: String, pc_iv: String) -> SharedRef {
         outgoing: None,
         last_text: None,
         recent: HashMap::new(),
+        fetch_host,
+        fetch_port,
+        last_image_ref: None,
+        last_image_sig: None,
     }))
+}
+
+/// Bind and spawn the vdfs 5679 server (serves PC images to the phone). The phone
+/// reaches it over `adb reverse` (USB) or our LAN IP.
+pub(crate) async fn start_vdfs_server(bind_addr: &str, pc_key: &str, pc_iv: &str) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(format!("{bind_addr}:5679"))
+        .await
+        .with_context(|| format!("bind {bind_addr}:5679"))?;
+    tracing::info!(bind = %bind_addr, "vdfs 5679 serving (PC→phone images)");
+    Ok(vdfs::spawn_server(listener, pc_key.into(), pc_iv.into(), config::CLIP_PC_ID.into()))
+}
+
+/// Mime hint from a path's extension (defaults to JPEG).
+fn mime_from_path(path: &str) -> &'static str {
+    match path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("bmp") => "image/bmp",
+        Some("tif") | Some("tiff") => "image/tiff",
+        _ => "image/jpeg",
+    }
+}
+
+/// Persist clipboard image bytes to a temp file the phone can later fetch over the
+/// 5679 server. Returns the local path.
+fn write_clip_image(bytes: &[u8], ts: u64) -> Result<String> {
+    let dir = std::env::temp_dir().join("pcsuite-clip");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("img_{ts}.jpeg"));
+    std::fs::write(&path, bytes)?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Spawn the 8904 accept loop (phone reverse-connections).
