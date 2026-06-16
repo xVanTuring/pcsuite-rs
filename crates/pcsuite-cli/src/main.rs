@@ -17,6 +17,7 @@
 //!   --seconds   run duration; 0 = run until Ctrl-C (default: 6)
 //!   --out       append raw HEVC frames to this file (playable later with ffplay)
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -106,7 +107,9 @@ fn print_help() {
          pcsuite verify-code (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify] \
          [--seconds <N>] [--out <f>]\n\
-         \x20                                       (all features on one connection; default = all)\n\n\
+         \x20                                       (clipboard+verify in the background; type\n\
+         \x20                                        `screen on`/`screen off` at the prompt to\n\
+         \x20                                        toggle mirroring. --screen starts it on.)\n\n\
          Transports: --usb (adb forward/reverse) or --phone <IP> (LAN ConnectFlow;\n\
          add --remote for connectType=1 / Tailscale). Over LAN the phone reverse-\n\
          connects to this machine's IP for clipboard + images, so allow inbound\n\
@@ -497,15 +500,16 @@ fn copy_to_clipboard(text: &str) {
 
 /// Unified session: screen + clipboard + verify-code over one control connection.
 async fn cmd_all(args: Args) -> Result<()> {
-    // default to every feature when none is explicitly requested
+    // Background features (clipboard + verify) default on; screen does NOT auto-start
+    // — toggle it at runtime from the prompt (or pass --screen to start it on).
     let any = args.feat_screen || args.feat_clipboard || args.feat_verify;
-    let (do_screen, do_clip, do_verify) = if any {
+    let (start_screen, do_clip, do_verify) = if any {
         (args.feat_screen, args.feat_clipboard, args.feat_verify)
     } else {
-        (true, true, true)
+        (false, true, true)
     };
     let identity = config::default_identity();
-    tracing::info!(screen = do_screen, clipboard = do_clip, verify = do_verify, "pcsuite all");
+    tracing::info!(screen = start_screen, clipboard = do_clip, verify = do_verify, "pcsuite all");
 
     let t = resolve_transport(&args, "all").await?;
     if do_clip {
@@ -537,62 +541,156 @@ async fn cmd_all(args: Args) -> Result<()> {
         session.enable_clipboard(cfg, Arc::new(MacClipboard)).await?;
     }
 
-    println!(
-        "🚀 unified session running ({}{}{}) — Ctrl-C to stop.",
-        if do_screen { "screen " } else { "" },
+    let bg = format!(
+        "{}{}",
         if do_clip { "clipboard " } else { "" },
         if do_verify { "verify-code" } else { "" }
     );
+    let interactive = args.seconds.is_none() && std::io::stdin().is_terminal();
+    let result = run_session(&mut session, &args, start_screen, bg.trim(), interactive).await;
 
-    let result: Result<()> = if do_screen {
-        let mut stream = session.enable_screen(ScreenParams::default()).await?;
-        let mut out = match &args.out {
-            Some(p) => Some(std::fs::File::create(p)?),
-            None => None,
-        };
-        let seconds = args.seconds.unwrap_or(0.0);
-        let t0 = Instant::now();
-        let limit = (seconds > 0.0).then(|| Duration::from_secs_f64(seconds));
-        let mut frames = 0u64;
-        loop {
-            if let Some(lim) = limit {
-                if t0.elapsed() >= lim {
-                    break;
-                }
-            }
-            let next = match limit {
-                Some(lim) => {
-                    let remaining = lim.saturating_sub(t0.elapsed()).max(Duration::from_millis(1));
-                    match tokio::time::timeout(remaining, stream.next_frame()).await {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    }
-                }
-                None => stream.next_frame().await,
-            };
-            let Some(frame) = next else { break };
-            frames += 1;
-            if let Some(f) = out.as_mut() {
-                use std::io::Write;
-                f.write_all(&frame)?;
-            }
-            if frames % 60 == 0 {
-                tracing::info!(frames, "…streaming");
-            }
+    drop(session); // aborts all feature tasks
+    cleanup_transport(&t, do_clip).await;
+    result
+}
+
+/// Runtime control of the screen feature over the live unified session: a handle
+/// whose presence means mirroring is on (dropping/aborting it stops mirroring).
+#[derive(Default)]
+struct ScreenToggle {
+    task: Option<tokio::task::JoinHandle<()>>,
+    frames: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScreenToggle {
+    fn is_on(&self) -> bool {
+        self.task.is_some()
+    }
+
+    async fn on(&mut self, session: &mut Session, args: &Args) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        if self.task.is_some() {
+            println!("· screen already on");
+            return;
         }
-        tracing::info!(frames, "screen stream ended");
-        Ok(())
-    } else {
+        let mut stream = match session.enable_screen(ScreenParams::default()).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("✗ screen failed: {e}");
+                return;
+            }
+        };
+        let frames = Arc::new(AtomicU64::new(0));
+        let fc = frames.clone();
+        let out_path = args.out.clone();
+        let task = tokio::spawn(async move {
+            let mut out = out_path.and_then(|p| std::fs::File::create(p).ok());
+            while let Some(frame) = stream.next_frame().await {
+                let n = fc.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(f) = out.as_mut() {
+                    use std::io::Write;
+                    let _ = f.write_all(&frame);
+                }
+                if n % 120 == 0 {
+                    tracing::info!(frames = n, "…streaming");
+                }
+            }
+        });
+        self.frames = frames;
+        self.task = Some(task);
+        let note = args.out.as_deref().map(|p| format!(" → {p}")).unwrap_or_default();
+        println!("▶ screen ON{note}");
+    }
+
+    fn off(&mut self) {
+        use std::sync::atomic::Ordering;
+        match self.task.take() {
+            Some(t) => {
+                t.abort();
+                println!("⏹ screen OFF ({} frames)", self.frames.load(Ordering::Relaxed));
+            }
+            None => println!("· screen already off"),
+        }
+    }
+}
+
+/// Drive the live session: start `start_screen`, then either block (non-interactive)
+/// or run a tiny prompt to toggle screen on demand (interactive TTY, no --seconds).
+async fn run_session(
+    session: &mut Session,
+    args: &Args,
+    start_screen: bool,
+    bg: &str,
+    interactive: bool,
+) -> Result<()> {
+    let mut screen = ScreenToggle::default();
+    if start_screen {
+        screen.on(session, args).await;
+    }
+
+    if !interactive {
+        println!("🚀 unified session running (background: {bg}) — Ctrl-C to stop.");
         let seconds = args.seconds.unwrap_or(0.0);
         if seconds > 0.0 {
             tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
         } else {
             let _ = tokio::signal::ctrl_c().await;
         }
-        Ok(())
-    };
+        if screen.is_on() {
+            screen.off();
+        }
+        return Ok(());
+    }
 
-    drop(session); // aborts all feature tasks
-    cleanup_transport(&t, do_clip).await;
-    result
+    println!("🚀 unified session running (background: {bg}).");
+    print_repl_help();
+
+    // Read stdin lines on a blocking thread; deliver them to the async loop.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            match line {
+                Ok(l) => {
+                    if tx.blocking_send(l).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => {
+                let Some(line) = maybe else { break }; // stdin closed (EOF / Ctrl-D)
+                match line.trim() {
+                    "" => {}
+                    "screen on" | "s on" | "on" => screen.on(session, args).await,
+                    "screen off" | "s off" | "off" => screen.off(),
+                    "status" | "st" => println!(
+                        "─ background: {bg} | screen: {}",
+                        if screen.is_on() {
+                            format!("ON ({} frames)", screen.frames.load(std::sync::atomic::Ordering::Relaxed))
+                        } else {
+                            "off".to_string()
+                        }
+                    ),
+                    "help" | "h" | "?" => print_repl_help(),
+                    "quit" | "exit" | "q" => break,
+                    other => println!("? unknown: {other:?}  (screen on | screen off | status | quit)"),
+                }
+            }
+            _ = tokio::signal::ctrl_c() => break,
+        }
+    }
+    if screen.is_on() {
+        screen.off();
+    }
+    Ok(())
+}
+
+fn print_repl_help() {
+    println!("  commands: screen on | screen off | status | help | quit   (clipboard/verify run in the background)");
 }
