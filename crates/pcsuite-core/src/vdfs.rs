@@ -2,9 +2,11 @@
 //! references by path.
 //!
 //! Two roles (mirrors the phone-suite's `vdfs` client + `vdfsServer`):
-//! - [`fetch`] — *client*: pull a phone file by path (phone→PC paste). Connects to
-//!   the phone's vdfs server (USB: `127.0.0.1:10382` via `adb forward`→5678; LAN:
-//!   `<phone>:5678`), STATs for the size, then READs the bytes.
+//! - *client* (phone→PC): [`fetch`] pulls a phone file by path (STAT for size, then
+//!   READ), [`stat`] returns its [`vdfs::Stat`] (mode/size/mtime), and [`list_dir`]
+//!   enumerates a directory — the operations a macOS File Provider needs to browse
+//!   the phone. Connects to the phone's vdfs server (USB: `127.0.0.1:10382` via
+//!   `adb forward`→5678; LAN: `<phone>:5678`).
 //! - [`spawn_server`] — *server* on 5679: serve a local PC file to the phone (PC→
 //!   phone paste). The phone STATs then READs (often in chunks); we answer each.
 //!
@@ -51,9 +53,10 @@ pub async fn fetch(
     path: &str,
 ) -> Result<Vec<u8>> {
     let name = format!("{device_id}{path}").into_bytes();
-    let size = stat(host, port, phone_key, phone_iv, &name)
+    let size = stat_name(host, port, phone_key, phone_iv, &name)
         .await
-        .context("vdfs stat")?;
+        .context("vdfs stat")?
+        .size;
     if size == 0 {
         bail!("vdfs stat returned size 0 for {path}");
     }
@@ -62,7 +65,45 @@ pub async fn fetch(
         .context("vdfs read")
 }
 
-async fn stat(host: &str, port: u16, key: &str, iv: &str, name: &[u8]) -> Result<u64> {
+/// STAT a phone path, returning its [`vdfs::Stat`] (mode/size/mtime). `device_id`
+/// is the phone's `mobileDeviceId`; `path` is the phone-side absolute path.
+pub async fn stat(
+    host: &str,
+    port: u16,
+    phone_key: &str,
+    phone_iv: &str,
+    device_id: &str,
+    path: &str,
+) -> Result<vdfs::Stat> {
+    let name = format!("{device_id}{path}").into_bytes();
+    stat_name(host, port, phone_key, phone_iv, &name)
+        .await
+        .context("vdfs stat")
+}
+
+/// List a phone directory, returning its entries (name + `d_type`). Attributes
+/// (size/mtime) come from a follow-up [`stat`] per entry, as the desktop client does.
+pub async fn list_dir(
+    host: &str,
+    port: u16,
+    phone_key: &str,
+    phone_iv: &str,
+    device_id: &str,
+    path: &str,
+) -> Result<Vec<vdfs::DirEntry>> {
+    let name = format!("{device_id}{path}").into_bytes();
+    let (ct, tag) = gcm12_seal(&vdfs::list_plaintext(0x43, &name), phone_key.as_bytes(), phone_iv.as_bytes())
+        .map_err(|e| anyhow::anyhow!("seal: {e}"))?;
+    let frame = vdfs::request_frame(&tag, &ct);
+    // LIST response length is unknown up front; read it from the response frame header.
+    let resp = roundtrip_framed(host, port, &frame).await.context("vdfs list")?;
+    let ctext = vdfs::response_ciphertext(&resp).context("short list response")?;
+    let pt = gcm12_open_noauth(ctext, phone_key.as_bytes(), phone_iv.as_bytes())
+        .map_err(|e| anyhow::anyhow!("open: {e}"))?;
+    Ok(vdfs::parse_dirent_list(&pt))
+}
+
+async fn stat_name(host: &str, port: u16, key: &str, iv: &str, name: &[u8]) -> Result<vdfs::Stat> {
     let (ct, tag) = gcm12_seal(&vdfs::stat_plaintext(0x41, name), key.as_bytes(), iv.as_bytes())
         .map_err(|e| anyhow::anyhow!("seal: {e}"))?;
     let frame = vdfs::request_frame(&tag, &ct);
@@ -71,7 +112,7 @@ async fn stat(host: &str, port: u16, key: &str, iv: &str, name: &[u8]) -> Result
     let ctext = vdfs::response_ciphertext(&resp).context("short stat response")?;
     let pt = gcm12_open_noauth(ctext, key.as_bytes(), iv.as_bytes())
         .map_err(|e| anyhow::anyhow!("open: {e}"))?;
-    vdfs::stat_size(&pt).context("stat size field missing")
+    vdfs::parse_stat(&pt).context("stat parse failed")
 }
 
 async fn read(host: &str, port: u16, key: &str, iv: &str, name: &[u8], size: u64, offset: u64) -> Result<Vec<u8>> {
@@ -109,6 +150,42 @@ async fn roundtrip(host: &str, port: u16, frame: &[u8], min_resp: usize) -> Resu
             break;
         }
         buf.extend_from_slice(&tmp[..n]);
+    }
+    Ok(buf)
+}
+
+/// Like [`roundtrip`] but for a response of unknown size: derive the total length
+/// from the response frame header (`03 ‖ BE32(cipherLen+17) ‖ 00 ‖ tag16 ‖ ct`, so
+/// total = 5 + BE32), then read exactly that. Used for LIST.
+async fn roundtrip_framed(host: &str, port: u16, frame: &[u8]) -> Result<Vec<u8>> {
+    let mut s = timeout(IO_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .with_context(|| format!("connect {host}:{port} timed out"))??;
+    s.set_nodelay(true).ok();
+    s.write_all(frame).await?;
+    s.flush().await?;
+    let mut buf = Vec::with_capacity(8192);
+    let mut tmp = vec![0u8; 65536];
+    let mut total: Option<usize> = None;
+    loop {
+        if let Some(t) = total {
+            if buf.len() >= t {
+                break;
+            }
+        }
+        let n = match timeout(IO_TIMEOUT, s.read(&mut tmp)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => break, // read timeout: return what we have
+        };
+        if n == 0 {
+            break; // EOF (vdfs closes after one response)
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if total.is_none() && buf.len() >= 5 && buf[0] == 0x03 {
+            let adv = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+            total = Some(5 + adv); // 5 + (cipherLen + 17) = 22 + cipherLen
+        }
     }
     Ok(buf)
 }
@@ -162,11 +239,14 @@ async fn serve_conn(mut stream: TcpStream, key: &str, iv: &str, pc_id: &str) -> 
 
     let resp_pt = match req.cmd {
         vdfs::CMD_STAT => {
-            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            tracing::info!(path = %path.display(), size, "vdfs STAT");
-            let mut st = STAT_TEMPLATE;
-            st[vdfs::STAT_SIZE_OFFSET..vdfs::STAT_SIZE_OFFSET + 8].copy_from_slice(&size.to_be_bytes());
+            let st = build_stat_response(&path);
+            tracing::info!(path = %path.display(), "vdfs STAT");
             st.to_vec()
+        }
+        vdfs::CMD_LIST => {
+            let entries = list_local_dir(&path);
+            tracing::info!(path = %path.display(), n = entries.len(), "vdfs LIST");
+            vdfs::serialize_dirent_list(&entries)
         }
         vdfs::CMD_READ => {
             let data = read_file_range(&path, req.offset, req.size).unwrap_or_default();
@@ -181,6 +261,48 @@ async fn serve_conn(mut stream: TcpStream, key: &str, iv: &str, pc_id: &str) -> 
     stream.write_all(&vdfs::response_frame(&tag, &ct)).await?;
     stream.flush().await?;
     Ok(())
+}
+
+/// Build a 74-byte STAT response for a local path: start from the captured
+/// template, then overwrite mode/size/mtime from real metadata (so directories
+/// report `S_IFDIR`). Missing metadata falls back to the template defaults.
+fn build_stat_response(path: &std::path::Path) -> [u8; vdfs::STAT_PLAINTEXT_LEN] {
+    let mut st = STAT_TEMPLATE;
+    if let Ok(md) = std::fs::metadata(path) {
+        st[vdfs::STAT_SIZE_OFFSET..vdfs::STAT_SIZE_OFFSET + 8].copy_from_slice(&md.len().to_be_bytes());
+        let mode: u32 = if md.is_dir() {
+            vdfs::S_IFDIR | 0o755
+        } else {
+            vdfs::S_IFREG | 0o644
+        };
+        st[vdfs::STAT_MODE_OFFSET..vdfs::STAT_MODE_OFFSET + 4].copy_from_slice(&mode.to_be_bytes());
+        if let Ok(secs) = md
+            .modified()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other))
+        {
+            st[vdfs::STAT_MTIME_OFFSET..vdfs::STAT_MTIME_OFFSET + 8]
+                .copy_from_slice(&secs.as_secs().to_be_bytes());
+        }
+    }
+    st
+}
+
+/// Enumerate a local directory into vdfs dir entries (name + `d_type`).
+fn list_local_dir(dir: &std::path::Path) -> Vec<vdfs::DirEntry> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            let d_type = match ent.file_type() {
+                Ok(ft) if ft.is_dir() => vdfs::DT_DIR,
+                Ok(ft) if ft.is_symlink() => vdfs::DT_LNK,
+                Ok(ft) if ft.is_file() => vdfs::DT_REG,
+                _ => 0,
+            };
+            out.push(vdfs::DirEntry { name, d_type });
+        }
+    }
+    out
 }
 
 fn read_file_range(path: &std::path::Path, offset: u64, size: u64) -> Result<Vec<u8>> {
@@ -256,5 +378,39 @@ mod tests {
         assert_eq!(got, content, "fetched bytes must match the served file");
 
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// LIST + STAT over the loopback server: enumerate a directory (a subdir and a
+    /// file) and STAT each, exercising the new dirent/stat parsers end to end.
+    #[tokio::test]
+    async fn list_and_stat_loopback() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let iv = "ABCDEFGHIJKLMNOP";
+        let pc_id = "pc0000";
+
+        let root = std::env::temp_dir().join(format!("pcsuite_vdfs_ls_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("hello.txt"), b"hello world").unwrap();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _srv = spawn_server(listener, key.into(), iv.into(), pc_id.into());
+
+        let dir = root.to_string_lossy().to_string();
+        let mut entries = list_dir("127.0.0.1", port, key, iv, pc_id, &dir).await.unwrap();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(entries.len(), 2, "expected sub/ and hello.txt");
+        assert_eq!(entries[0], pcsuite_proto::vdfs::DirEntry { name: "hello.txt".into(), d_type: pcsuite_proto::vdfs::DT_REG });
+        assert_eq!(entries[1], pcsuite_proto::vdfs::DirEntry { name: "sub".into(), d_type: pcsuite_proto::vdfs::DT_DIR });
+
+        let file_st = stat("127.0.0.1", port, key, iv, pc_id, &format!("{dir}/hello.txt")).await.unwrap();
+        assert!(file_st.is_file() && !file_st.is_dir());
+        assert_eq!(file_st.size, 11);
+
+        let dir_st = stat("127.0.0.1", port, key, iv, pc_id, &format!("{dir}/sub")).await.unwrap();
+        assert!(dir_st.is_dir() && !dir_st.is_file());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

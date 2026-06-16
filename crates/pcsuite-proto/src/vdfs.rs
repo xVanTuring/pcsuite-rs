@@ -16,8 +16,22 @@
 //! name = <deviceId><path>
 //! ```
 //!
-//! A STAT response plaintext is a 74-byte stat structure with the file size as a
-//! BE64 at offset 30; a READ response plaintext is the raw file bytes.
+//! A STAT response plaintext is a 74-byte POSIX-`stat` structure (QDataStream,
+//! big-endian): `st_mode` is a BE32 at offset 12 (`& S_IFMT` distinguishes
+//! dir/file/symlink), the file size a BE64 at offset 30, and `st_mtime` a BE64
+//! (seconds) at offset 58. A READ response plaintext is the raw file bytes.
+//!
+//! A LIST (CMD_LIST) response plaintext is a sequence of directory entries with
+//! **no leading count** (each is self-delimiting; parse to end of buffer). Per
+//! entry, QDataStream big-endian:
+//!
+//! ```text
+//! u32 reserved | u64 reserved | u16 nameLen | u8 dType | name (nameLen bytes + trailing NUL)
+//!   dType: 4 = dir (DT_DIR), 8 = file (DT_REG), 0xa = symlink (DT_LNK)
+//! ```
+//!
+//! The two reserved words are 0 from the desktop serializer; the client fills real
+//! attributes by STATing each entry. See [`parse_dirent_list`] / [`Stat`].
 //!
 //! Framing differs per direction but both put the 16-byte GCM tag *before* the
 //! ciphertext:
@@ -43,8 +57,64 @@ pub const REQUEST_CT_OFFSET: usize = 24;
 pub const RESPONSE_CT_OFFSET: usize = 22;
 /// Size of a STAT response plaintext (stat structure).
 pub const STAT_PLAINTEXT_LEN: usize = 74;
+/// Offset of the BE32 `st_mode` field inside a STAT response plaintext.
+pub const STAT_MODE_OFFSET: usize = 12;
 /// Offset of the BE64 file-size field inside a STAT response plaintext.
 pub const STAT_SIZE_OFFSET: usize = 30;
+/// Offset of the BE64 `st_mtime` (seconds) field inside a STAT response plaintext.
+pub const STAT_MTIME_OFFSET: usize = 58;
+
+/// `st_mode` file-type mask and the types we care about (POSIX values).
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+
+/// Directory-entry `d_type` values (POSIX `dirent`).
+pub const DT_DIR: u8 = 4;
+pub const DT_REG: u8 = 8;
+pub const DT_LNK: u8 = 0xa;
+
+/// Decoded file attributes from a STAT response (the fields Finder needs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stat {
+    /// POSIX `st_mode` (type bits + permissions).
+    pub mode: u32,
+    /// File size in bytes.
+    pub size: u64,
+    /// Modification time, seconds since the Unix epoch.
+    pub mtime: u64,
+}
+
+impl Stat {
+    pub fn is_dir(&self) -> bool {
+        self.mode & S_IFMT == S_IFDIR
+    }
+    pub fn is_file(&self) -> bool {
+        self.mode & S_IFMT == S_IFREG
+    }
+    pub fn is_symlink(&self) -> bool {
+        self.mode & S_IFMT == S_IFLNK
+    }
+}
+
+/// One directory entry from a LIST response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    /// File name (UTF-8; lossily decoded). Not a full path.
+    pub name: String,
+    /// POSIX `d_type` ([`DT_DIR`] / [`DT_REG`] / [`DT_LNK`] / 0 = unknown).
+    pub d_type: u8,
+}
+
+impl DirEntry {
+    pub fn is_dir(&self) -> bool {
+        self.d_type == DT_DIR
+    }
+    pub fn is_file(&self) -> bool {
+        self.d_type == DT_REG
+    }
+}
 
 /// A decoded request (server side).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +144,15 @@ pub fn stat_plaintext(seq: u8, name: &[u8]) -> Vec<u8> {
     body.extend_from_slice(&(name.len() as u32).to_be_bytes());
     body.extend_from_slice(name);
     request_plaintext(seq, CMD_STAT, &body)
+}
+
+/// Build a LIST request plaintext for `name` (`<deviceId><dirPath>`). The body is
+/// identical to STAT (`BE32 nameLen ‖ name`); only the command byte differs.
+pub fn list_plaintext(seq: u8, name: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + name.len());
+    body.extend_from_slice(&(name.len() as u32).to_be_bytes());
+    body.extend_from_slice(name);
+    request_plaintext(seq, CMD_LIST, &body)
 }
 
 /// Build a READ request plaintext for `size` bytes at `offset` of `name`.
@@ -157,6 +236,69 @@ pub fn stat_size(pt: &[u8]) -> Option<u64> {
     be64(pt, STAT_SIZE_OFFSET)
 }
 
+/// Parse a decrypted STAT response plaintext into [`Stat`] (mode, size, mtime).
+/// Returns `None` if shorter than [`STAT_PLAINTEXT_LEN`].
+pub fn parse_stat(pt: &[u8]) -> Option<Stat> {
+    if pt.len() < STAT_PLAINTEXT_LEN {
+        return None;
+    }
+    Some(Stat {
+        mode: be32(pt, STAT_MODE_OFFSET)?,
+        size: be64(pt, STAT_SIZE_OFFSET)?,
+        mtime: be64(pt, STAT_MTIME_OFFSET)?,
+    })
+}
+
+/// Parse a decrypted LIST response plaintext into directory entries (see the
+/// module docs for the wire format). Entries are self-delimiting; parsing stops at
+/// the end of the buffer or the first truncated entry. `.` and `..` are skipped.
+pub fn parse_dirent_list(pt: &[u8]) -> Vec<DirEntry> {
+    // header per entry: u32 + u64 + u16(nameLen) + u8(dType) = 15 bytes.
+    const HDR: usize = 4 + 8 + 2 + 1;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + HDR <= pt.len() {
+        let name_len = match be16(pt, i + 12) {
+            Some(v) => v as usize,
+            None => break,
+        };
+        let d_type = pt[i + 14];
+        let name_start = i + HDR;
+        let name_end = match name_start.checked_add(name_len) {
+            Some(e) if e <= pt.len() => e,
+            _ => break, // truncated final entry
+        };
+        let name = String::from_utf8_lossy(&pt[name_start..name_end]).into_owned();
+        // The serializer writes nameLen+1 bytes (name + trailing NUL); skip the NUL.
+        i = name_end + 1;
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        out.push(DirEntry { name, d_type });
+    }
+    out
+}
+
+/// Serialize directory entries into a LIST response plaintext, mirroring the
+/// phone-suite's `getDirentAttr` (per entry `u32(0) u64(0) u16 nameLen u8 dType
+/// name+NUL`, big-endian, no leading count). Inverse of [`parse_dirent_list`].
+pub fn serialize_dirent_list(entries: &[DirEntry]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for e in entries {
+        let name = e.name.as_bytes();
+        out.extend_from_slice(&0u32.to_be_bytes());
+        out.extend_from_slice(&0u64.to_be_bytes());
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.push(e.d_type);
+        out.extend_from_slice(name);
+        out.push(0x00); // trailing NUL (writeRawData wrote nameLen+1)
+    }
+    out
+}
+
+fn be16(b: &[u8], at: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
+}
 fn be32(b: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
@@ -225,5 +367,76 @@ mod tests {
         pt[STAT_SIZE_OFFSET..STAT_SIZE_OFFSET + 8].copy_from_slice(&12345u64.to_be_bytes());
         assert_eq!(stat_size(&pt), Some(12345));
         assert_eq!(stat_size(&pt[..20]), None);
+    }
+
+    #[test]
+    fn list_request_roundtrip() {
+        let name = b"52467a/storage/emulated/0/DCIM";
+        let pt = list_plaintext(0x43, name);
+        assert_eq!(pt[21], CMD_LIST);
+        let req = parse_request(&pt).unwrap();
+        assert_eq!(req.cmd, CMD_LIST);
+        assert_eq!(req.name, name);
+        assert_eq!((req.size, req.offset), (0, 0));
+    }
+
+    /// A real 74-byte STAT response captured from the phone-suite (a regular file).
+    /// Validates the field offsets reverse-engineered from `AssembleAttrReply`.
+    #[test]
+    fn parse_stat_from_real_template() {
+        let pt: [u8; STAT_PLAINTEXT_LEN] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x81, 0x80, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf5, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x12, 0xae, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x2f,
+            0xd6, 0xa6, 0x00, 0x00, 0x00, 0x00, 0x6a, 0x2f, 0xd6, 0xa4, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        let st = parse_stat(&pt).unwrap();
+        assert_eq!(st.mode, 0o100600); // 0x8180 = S_IFREG | 0600
+        assert!(st.is_file() && !st.is_dir() && !st.is_symlink());
+        assert_eq!(st.size, 922286);
+        assert_eq!(st.mtime, 0x6a2f_d6a4); // 2026-06-09, seconds
+        assert_eq!(parse_stat(&pt[..40]), None);
+    }
+
+    #[test]
+    fn stat_dir_mode_detected() {
+        let mut pt = vec![0u8; STAT_PLAINTEXT_LEN];
+        pt[STAT_MODE_OFFSET..STAT_MODE_OFFSET + 4].copy_from_slice(&0o040755u32.to_be_bytes());
+        let st = parse_stat(&pt).unwrap();
+        assert!(st.is_dir() && !st.is_file());
+    }
+
+    #[test]
+    fn dirent_list_roundtrip_skips_dot_entries() {
+        let entries = vec![
+            DirEntry { name: ".".into(), d_type: DT_DIR },
+            DirEntry { name: "..".into(), d_type: DT_DIR },
+            DirEntry { name: "Camera".into(), d_type: DT_DIR },
+            DirEntry { name: "截图".into(), d_type: DT_DIR }, // multibyte UTF-8
+            DirEntry { name: "IMG_0001.jpg".into(), d_type: DT_REG },
+        ];
+        let wire = serialize_dirent_list(&entries);
+        let parsed = parse_dirent_list(&wire);
+        assert_eq!(
+            parsed,
+            vec![
+                DirEntry { name: "Camera".into(), d_type: DT_DIR },
+                DirEntry { name: "截图".into(), d_type: DT_DIR },
+                DirEntry { name: "IMG_0001.jpg".into(), d_type: DT_REG },
+            ]
+        );
+        assert!(parsed[0].is_dir() && parsed[2].is_file());
+    }
+
+    #[test]
+    fn parse_dirent_list_tolerates_truncation() {
+        let entries = vec![DirEntry { name: "a.txt".into(), d_type: DT_REG }];
+        let wire = serialize_dirent_list(&entries);
+        // chop the trailing NUL + part of the name: must not panic, drops the bad tail
+        let _ = parse_dirent_list(&wire[..wire.len() - 3]);
+        assert!(parse_dirent_list(&[]).is_empty());
+        assert!(parse_dirent_list(&[0u8; 10]).is_empty()); // header-only, no body
     }
 }

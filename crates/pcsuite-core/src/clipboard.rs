@@ -406,6 +406,36 @@ async fn fetch_image_task(img: clip::ImageRef, shared: SharedRef, backend: Arc<d
             return;
         }
     };
+
+    // ── opt-in real-device probe (PCSUITE_VDFS_PROBE=1): the phone's vdfs port is
+    // open right now (we just fetched), so exercise the new list_dir/stat against it.
+    if std::env::var_os("PCSUITE_VDFS_PROBE").is_some() {
+        let img_dir = img.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("/").to_string();
+        // list the image's own dir, plus a path that contains subdirectories so we
+        // can confirm DT_DIR (d_type==4) decoding on real hardware.
+        for dir in [img_dir.as_str(), "/storage/emulated/0"] {
+            match vdfs::list_dir(&host, port, &pk, &piv, &pid, dir).await {
+                Ok(entries) => {
+                    let dirs = entries.iter().filter(|e| e.is_dir()).count();
+                    let files = entries.iter().filter(|e| e.is_file()).count();
+                    tracing::info!(%dir, n = entries.len(), dirs, files, "[vdfs-probe] list_dir OK");
+                    for e in entries.iter().take(30) {
+                        let kind = if e.is_dir() { "DIR " } else if e.is_file() { "FILE" } else { "?   " };
+                        tracing::info!("[vdfs-probe]   {kind} {}", e.name);
+                    }
+                }
+                Err(e) => tracing::warn!(err = %e, %dir, "[vdfs-probe] list_dir failed"),
+            }
+        }
+        match vdfs::stat(&host, port, &pk, &piv, &pid, &img.path).await {
+            Ok(st) => tracing::info!(
+                mode = format!("0o{:o}", st.mode), size = st.size, mtime = st.mtime,
+                is_dir = st.is_dir(), is_file = st.is_file(), "[vdfs-probe] stat OK"
+            ),
+            Err(e) => tracing::warn!(err = %e, "[vdfs-probe] stat failed"),
+        }
+    }
+
     let n = bytes.len();
     let mime = mime_from_path(&img.path).to_string();
     let b = backend.clone();
