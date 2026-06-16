@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Backups / editor
+**/*.rs.bk
+*.pdb
+
+# OS
+.DS_Store
+
+# Local captures / scratch
+*.h265
+*.hevc

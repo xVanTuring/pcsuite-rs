@@ -1,0 +1,18 @@
+[package]
+name = "pcsuite-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless CLI driving pcsuite-core: connect + screen-mirror (frame counting / raw HEVC dump)."
+
+[[bin]]
+name = "pcsuite"
+path = "src/main.rs"
+
+[dependencies]
+pcsuite-core = { path = "../pcsuite-core" }
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
