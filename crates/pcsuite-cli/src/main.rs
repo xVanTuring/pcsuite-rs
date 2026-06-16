@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use pcsuite_core::{
     config, register, run_clipboard, run_verify, usb, ClipboardBackend, ClipboardConfig,
-    RegisterConfig, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
+    RegisterConfig, Registration, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
 };
 
 struct Args {
@@ -102,13 +102,15 @@ fn print_help() {
          pcsuite screen --usb [--seconds <N>] [--out <file.h265>]\n  \
          pcsuite screen --phone <IP> [--reg-ip <IP>] [--data-ip <IP>] [--remote] \
          [--seconds <N>] [--out <file.h265>] [--input-test]\n  \
-         pcsuite clipboard --usb [--seconds <N>]   (text sync; --seconds 0 = forever)\n  \
-         pcsuite verify-code --usb [--seconds <N>] (SMS code relay → clipboard)\n  \
-         pcsuite all --usb [--screen|--clipboard|--verify] [--seconds <N>] [--out <f>]\n\
+         pcsuite clipboard  (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
+         pcsuite verify-code (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
+         pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify] \
+         [--seconds <N>] [--out <f>]\n\
          \x20                                       (all features on one connection; default = all)\n\n\
-         Gets a token onto the phone (USB adb, or LAN ConnectFlow), opens the\n\
-         screen-mirror data plane, and counts frames (or dumps raw HEVC with --out).\n\
-         --input-test scrolls the phone centre to verify mouse/scroll injection."
+         Transports: --usb (adb forward/reverse) or --phone <IP> (LAN ConnectFlow;\n\
+         add --remote for connectType=1 / Tailscale). Over LAN the phone reverse-\n\
+         connects to this machine's IP for clipboard + images, so allow inbound\n\
+         8904/5679 if a firewall is on. --input-test scrolls to verify injection."
     );
 }
 
@@ -140,14 +142,47 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_screen(args: Args) -> Result<()> {
-    // Resolve (data_ip, token) per mode. `_reg` keeps the LAN presence task alive;
-    // `usb_adb` triggers adb-forward cleanup at the end.
-    let (data_ip, token, _reg, usb_adb): (String, String, Option<_>, Option<String>) = if args.usb {
-        tracing::info!("pcsuite screen — USB (adb) mode");
+/// Everything a feature needs, resolved for either transport (USB adb / LAN-remote).
+struct Transport {
+    /// Control + video host (and the 8904-handshake host).
+    data_ip: String,
+    token: String,
+    /// IP the phone uses to reverse-connect to our 8904/5679 (SHADOW_LIKE `pcInfo.ip`).
+    pc_ip: String,
+    /// Where we bind our 8904/5679 servers.
+    bind_addr: String,
+    /// SHADOW_LIKE `pcInfo.connectType`: `"USB"` or `"WLAN"`.
+    connect_type: String,
+    /// Host:port of the phone's vdfs server for image fetch (phone→PC).
+    vdfs_fetch_host: String,
+    vdfs_fetch_port: u16,
+    /// `Some(adb)` over USB — drives the clipboard port forwards + cleanup.
+    usb_adb: Option<String>,
+    /// Holds the LAN SSDP-presence task alive until the session ends.
+    _reg: Option<Registration>,
+}
+
+/// Resolve the transport: USB (adb) when `--usb`, else LAN/remote ConnectFlow.
+///
+/// USB tunnels everything through `127.0.0.1` (the phone reaches our servers over
+/// `adb reverse`, we reach the phone's vdfs over `adb forward`). LAN binds our
+/// servers on all interfaces and tells the phone our real interface IP; image
+/// fetch goes straight to `<phone>:5678`.
+async fn resolve_transport(args: &Args, feature: &str) -> Result<Transport> {
+    if args.usb {
+        tracing::info!(feature, "USB (adb) mode");
         let session = usb::prepare(UsbConfig::default()).await?;
-        let adb = session.adb.clone();
-        ("127.0.0.1".to_string(), session.token, None, Some(adb))
+        Ok(Transport {
+            data_ip: "127.0.0.1".into(),
+            token: session.token,
+            pc_ip: "127.0.0.1".into(),
+            bind_addr: "127.0.0.1".into(),
+            connect_type: "USB".into(),
+            vdfs_fetch_host: "127.0.0.1".into(),
+            vdfs_fetch_port: 10382,
+            usb_adb: Some(session.adb),
+            _reg: None,
+        })
     } else {
         let phone = args.phone.clone().context("--phone <IP> is required (or use --usb)")?;
         let reg_ip = args.reg_ip.clone().unwrap_or_else(|| phone.clone());
@@ -157,7 +192,7 @@ async fn cmd_screen(args: Args) -> Result<()> {
         } else {
             config::default_stored_seed(&reg_ip)
         };
-        tracing::info!(%reg_ip, %data_ip, remote = args.remote, "pcsuite screen — LAN mode");
+        tracing::info!(feature, %reg_ip, %data_ip, remote = args.remote, "LAN mode");
         let reg = register(RegisterConfig {
             reg_ip,
             identity: config::default_identity(),
@@ -169,15 +204,48 @@ async fn cmd_screen(args: Args) -> Result<()> {
         })
         .await?;
         let token = reg.token.clone();
-        (data_ip, token, Some(reg), None)
-    };
-    tracing::info!(token = %&token[..10.min(token.len())], "token ready (…)");
-
-    let result = stream_screen(&data_ip, &token, &args).await;
-
-    if let Some(adb) = usb_adb {
-        usb::cleanup(&adb).await;
+        let pc_ip = local_ip_toward(&data_ip)
+            .context("could not determine this machine's IP toward the phone")?;
+        tracing::info!(%pc_ip, "phone will reverse-connect to this IP for clipboard/images");
+        Ok(Transport {
+            data_ip: data_ip.clone(),
+            token,
+            pc_ip,
+            bind_addr: "0.0.0.0".into(),
+            connect_type: "WLAN".into(),
+            vdfs_fetch_host: data_ip,
+            vdfs_fetch_port: 5678,
+            usb_adb: None,
+            _reg: Some(reg),
+        })
     }
+}
+
+/// Tear down whatever [`resolve_transport`] set up. `clipboard` removes the
+/// clipboard-specific USB forwards too.
+async fn cleanup_transport(t: &Transport, clipboard: bool) {
+    if let Some(adb) = &t.usb_adb {
+        if clipboard {
+            teardown_clipboard_forwards(adb).await;
+        }
+        usb::cleanup(adb).await;
+    }
+}
+
+/// The local interface IP that routes toward `peer` (UDP "connect" picks the route
+/// without sending a packet). Works for both LAN and Tailscale peers.
+fn local_ip_toward(peer: &str) -> Option<String> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((peer, 9)).ok()?; // discard service; no traffic sent
+    Some(sock.local_addr().ok()?.ip().to_string())
+}
+
+async fn cmd_screen(args: Args) -> Result<()> {
+    let t = resolve_transport(&args, "screen").await?;
+    tracing::info!(token = %&t.token[..10.min(t.token.len())], "token ready (…)");
+    let result = stream_screen(&t.data_ip, &t.token, &args).await;
+    cleanup_transport(&t, false).await;
     result
 }
 
@@ -256,24 +324,22 @@ async fn stream_screen(data_ip: &str, token: &str, args: &Args) -> Result<()> {
 }
 
 async fn cmd_clipboard(args: Args) -> Result<()> {
-    if !args.usb {
-        anyhow::bail!("`clipboard` currently supports --usb only (LAN support coming next)");
-    }
     let identity = config::default_identity();
-    tracing::info!("pcsuite clipboard — USB (adb) mode");
-    let session = usb::prepare(UsbConfig::default()).await?;
-    setup_clipboard_forwards(&session.adb).await;
+    let t = resolve_transport(&args, "clipboard").await?;
+    if let Some(adb) = &t.usb_adb {
+        setup_clipboard_forwards(adb).await;
+    }
 
     let cfg = ClipboardConfig {
-        data_ip: "127.0.0.1".into(),
-        pc_ip: "127.0.0.1".into(),
-        bind_addr: "127.0.0.1".into(),
-        token: session.token.clone(),
+        data_ip: t.data_ip.clone(),
+        pc_ip: t.pc_ip.clone(),
+        bind_addr: t.bind_addr.clone(),
+        token: t.token.clone(),
         open_id: identity.open_id.clone(),
         device_name: identity.device_name.clone(),
-        connect_type: "USB".into(),
-        vdfs_fetch_host: "127.0.0.1".into(),
-        vdfs_fetch_port: 10382,
+        connect_type: t.connect_type.clone(),
+        vdfs_fetch_host: t.vdfs_fetch_host.clone(),
+        vdfs_fetch_port: t.vdfs_fetch_port,
     };
     let backend: Arc<dyn ClipboardBackend> = Arc::new(MacClipboard);
 
@@ -292,8 +358,7 @@ async fn cmd_clipboard(args: Args) -> Result<()> {
         run.await
     };
 
-    teardown_clipboard_forwards(&session.adb).await;
-    usb::cleanup(&session.adb).await;
+    cleanup_transport(&t, true).await;
     result
 }
 
@@ -391,14 +456,10 @@ impl ClipboardBackend for MacClipboard {
 }
 
 async fn cmd_verify(args: Args) -> Result<()> {
-    if !args.usb {
-        anyhow::bail!("`verify-code` currently supports --usb only");
-    }
-    tracing::info!("pcsuite verify-code — USB (adb) mode");
-    let session = usb::prepare(UsbConfig::default()).await?;
+    let t = resolve_transport(&args, "verify-code").await?;
     let cfg = VerifyConfig {
-        data_ip: "127.0.0.1".into(),
-        token: session.token.clone(),
+        data_ip: t.data_ip.clone(),
+        token: t.token.clone(),
     };
     println!("🔑 verify-code relay running — receive an SMS code on the phone; it'll be copied to the Mac clipboard. Ctrl-C to stop.");
     let run = run_verify(cfg, |code, sign| {
@@ -417,7 +478,7 @@ async fn cmd_verify(args: Args) -> Result<()> {
     } else {
         run.await
     };
-    usb::cleanup(&session.adb).await;
+    cleanup_transport(&t, false).await;
     result
 }
 
@@ -436,9 +497,6 @@ fn copy_to_clipboard(text: &str) {
 
 /// Unified session: screen + clipboard + verify-code over one control connection.
 async fn cmd_all(args: Args) -> Result<()> {
-    if !args.usb {
-        anyhow::bail!("`all` currently supports --usb only");
-    }
     // default to every feature when none is explicitly requested
     let any = args.feat_screen || args.feat_clipboard || args.feat_verify;
     let (do_screen, do_clip, do_verify) = if any {
@@ -447,14 +505,16 @@ async fn cmd_all(args: Args) -> Result<()> {
         (true, true, true)
     };
     let identity = config::default_identity();
-    tracing::info!(screen = do_screen, clipboard = do_clip, verify = do_verify, "pcsuite all — USB (adb)");
+    tracing::info!(screen = do_screen, clipboard = do_clip, verify = do_verify, "pcsuite all");
 
-    let usb_session = usb::prepare(UsbConfig::default()).await?;
+    let t = resolve_transport(&args, "all").await?;
     if do_clip {
-        setup_clipboard_forwards(&usb_session.adb).await;
+        if let Some(adb) = &t.usb_adb {
+            setup_clipboard_forwards(adb).await;
+        }
     }
 
-    let mut session = Session::connect("127.0.0.1", &usb_session.token).await?;
+    let mut session = Session::connect(&t.data_ip, &t.token).await?;
 
     if do_verify {
         session.enable_verify(|code, sign| {
@@ -464,15 +524,15 @@ async fn cmd_all(args: Args) -> Result<()> {
     }
     if do_clip {
         let cfg = ClipboardConfig {
-            data_ip: "127.0.0.1".into(),
-            pc_ip: "127.0.0.1".into(),
-            bind_addr: "127.0.0.1".into(),
-            token: usb_session.token.clone(),
+            data_ip: t.data_ip.clone(),
+            pc_ip: t.pc_ip.clone(),
+            bind_addr: t.bind_addr.clone(),
+            token: t.token.clone(),
             open_id: identity.open_id.clone(),
             device_name: identity.device_name.clone(),
-            connect_type: "USB".into(),
-            vdfs_fetch_host: "127.0.0.1".into(),
-            vdfs_fetch_port: 10382,
+            connect_type: t.connect_type.clone(),
+            vdfs_fetch_host: t.vdfs_fetch_host.clone(),
+            vdfs_fetch_port: t.vdfs_fetch_port,
         };
         session.enable_clipboard(cfg, Arc::new(MacClipboard)).await?;
     }
@@ -533,9 +593,6 @@ async fn cmd_all(args: Args) -> Result<()> {
     };
 
     drop(session); // aborts all feature tasks
-    if do_clip {
-        teardown_clipboard_forwards(&usb_session.adb).await;
-    }
-    usb::cleanup(&usb_session.adb).await;
+    cleanup_transport(&t, do_clip).await;
     result
 }
