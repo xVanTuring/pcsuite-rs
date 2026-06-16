@@ -1,0 +1,21 @@
+[package]
+name = "pcsuite-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "swift-bridge bindings over pcsuite-core for a native SwiftUI macOS app."
+
+[lib]
+# staticlib -> link libpcsuite_ffi.a straight into the Xcode app target.
+crate-type = ["staticlib"]
+
+[dependencies]
+pcsuite-core = { path = "../pcsuite-core" }
+
+tokio.workspace = true
+anyhow.workspace = true
+tracing-subscriber.workspace = true
+swift-bridge = "0.1"
+
+[build-dependencies]
+swift-bridge-build = "0.1"

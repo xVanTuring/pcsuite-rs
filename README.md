@@ -17,6 +17,7 @@ to a platform frontend (FFI / IPC / Flutter — deliberately deferred).
 | `pcsuite-net`    | SSDP, TLS (rustls/ring, accepts self-signed), hand-rolled RFC6455 WS client |
 | `pcsuite-core`   | sessions: ConnectFlow registration, screen data plane, control input, clipboard relay, USB (adb) path |
 | `pcsuite-cli`    | headless `pcsuite` binary that drives the core |
+| `pcsuite-ffi`    | swift-bridge bindings (static lib + generated Swift) for a SwiftUI macOS app — see `crates/pcsuite-ffi/SWIFT_INTEGRATION.md` |
 
 ## Build
 

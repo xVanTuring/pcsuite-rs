@@ -6,6 +6,7 @@ members = [
     "crates/pcsuite-net",
     "crates/pcsuite-core",
     "crates/pcsuite-cli",
+    "crates/pcsuite-ffi",
 ]
 
 [workspace.package]
