@@ -20,12 +20,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 
+use tokio::task::JoinHandle;
+
 use pcsuite_crypto::{gcm_decrypt, gcm_encrypt};
 use pcsuite_net::ws::WsFrame;
 use pcsuite_proto::clip::{self, PcInfo};
 use pcsuite_proto::ruying::{self, Parsed, RuyingFrame};
 
 use crate::config;
+use crate::session::ControlHandle;
 use crate::wsconn::open_ws;
 
 const ECHO_WINDOW: Duration = Duration::from_secs(6);
@@ -54,7 +57,7 @@ pub struct ClipboardConfig {
     pub connect_type: String,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     pc_key: String,
     pc_iv: String,
     phone_key: Option<String>,
@@ -76,7 +79,7 @@ impl Shared {
     }
 }
 
-type SharedRef = Arc<Mutex<Shared>>;
+pub(crate) type SharedRef = Arc<Mutex<Shared>>;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -390,4 +393,101 @@ async fn watcher(shared: SharedRef, backend: Arc<dyn ClipboardBackend>, device_n
             tracing::info!(text = %preview(&cur), "[PC→phone] clipboard text");
         }
     }
+}
+
+// ───────────────────────── shared building blocks (used by the unified session) ─────────────────────────
+
+/// Generate a fresh PC key (32 chars) + iv (16 chars) for the relay.
+pub(crate) fn rand_clip_keys() -> (String, String) {
+    (rand_chars(32), rand_chars(16))
+}
+
+/// Build the shared relay state.
+pub(crate) fn new_shared(pc_key: String, pc_iv: String) -> SharedRef {
+    Arc::new(Mutex::new(Shared {
+        pc_key,
+        pc_iv,
+        phone_key: None,
+        phone_iv: None,
+        phone_id: "52467a".into(),
+        outgoing: None,
+        last_text: None,
+        recent: HashMap::new(),
+    }))
+}
+
+/// Spawn the 8904 accept loop (phone reverse-connections).
+pub(crate) fn spawn_8904_server(
+    listener: TcpListener,
+    shared: SharedRef,
+    backend: Arc<dyn ClipboardBackend>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, addr)) => {
+                    tracing::info!(%addr, "phone connected to 8904");
+                    if let Err(e) = handle_8904(stream, shared.clone(), backend.clone()).await {
+                        tracing::warn!(err = %e, "8904 connection ended");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, "8904 accept failed");
+                    break;
+                }
+            }
+        }
+    })
+}
+
+/// Spawn the OS-clipboard watcher (PC → phone).
+pub(crate) fn spawn_watcher(
+    shared: SharedRef,
+    backend: Arc<dyn ClipboardBackend>,
+    device_name: String,
+) -> JoinHandle<()> {
+    tokio::spawn(async move { watcher(shared, backend, device_name).await })
+}
+
+/// Drive the SHADOW_LIKE handshake over a shared control channel: send `startup`,
+/// wait for the phone's key/iv, store them, send `ready`.
+pub(crate) async fn clip_handshake(control: ControlHandle, shared: SharedRef, startup_msg: String) {
+    use tokio::sync::broadcast::error::RecvError;
+    // Subscribe before sending, so we can't miss a reply to our own startup...
+    let mut rx = control.subscribe();
+    let _ = control.send(startup_msg).await;
+    // ...but the phone may have announced its key *before* we subscribed, so also
+    // check the retained last-SHADOW_LIKE.
+    if let Some(t) = control.last_shadow() {
+        if apply_shadow(&control, &shared, &t).await {
+            return;
+        }
+    }
+    loop {
+        match rx.recv().await {
+            Ok(t) => {
+                if apply_shadow(&control, &shared, &t).await {
+                    return;
+                }
+            }
+            Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => return,
+        }
+    }
+}
+
+/// If `t` is a phone SHADOW_LIKE reply carrying a key, store it and send `ready`.
+async fn apply_shadow(control: &ControlHandle, shared: &SharedRef, t: &str) -> bool {
+    let Some(sess) = clip::parse_shadow_reply(t) else {
+        return false;
+    };
+    {
+        let mut sh = shared.lock().await;
+        sh.phone_key = Some(sess.key);
+        sh.phone_iv = Some(sess.iv);
+        sh.phone_id = sess.mobile_device_id;
+    }
+    let _ = control.send(clip::shadow_ready()).await;
+    tracing::info!("clipboard: phone key received; sent SHADOW_LIKE ready");
+    true
 }

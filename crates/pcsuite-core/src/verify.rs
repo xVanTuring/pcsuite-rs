@@ -13,6 +13,7 @@ use pcsuite_net::ws::WsFrame;
 use pcsuite_proto::verify;
 
 use crate::config;
+use crate::session::ControlHandle;
 use crate::wsconn::open_ws;
 
 /// Where to run the verify-code relay.
@@ -63,4 +64,28 @@ where
         }
     }
     Ok(())
+}
+
+/// Verify-code as a feature on a shared control channel (for the unified session):
+/// send `PC_CONFIG`, then call `on_code` for every forwarded SMS code.
+pub async fn verify_feature<F>(control: ControlHandle, on_code: F)
+where
+    F: Fn(&str, &str) + Send + 'static,
+{
+    use tokio::sync::broadcast::error::RecvError;
+    let mut rx = control.subscribe();
+    let _ = control.send(verify::pc_config()).await;
+    tracing::info!("verify-code: sent PC_CONFIG (verifyCode:true)");
+    loop {
+        match rx.recv().await {
+            Ok(t) => {
+                if let Some(sms) = verify::parse_sms_code(&t) {
+                    tracing::info!(code = %sms.code, sign = %sms.sign, "★ SMS verify code");
+                    on_code(&sms.code, &sms.sign);
+                }
+            }
+            Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => break,
+        }
+    }
 }

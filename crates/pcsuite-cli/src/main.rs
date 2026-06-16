@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use pcsuite_core::{
     config, register, run_clipboard, run_verify, usb, ClipboardBackend, ClipboardConfig,
-    RegisterConfig, Screen, ScreenParams, UsbConfig, VerifyConfig,
+    RegisterConfig, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
 };
 
 struct Args {
@@ -36,6 +36,9 @@ struct Args {
     seconds: Option<f64>,
     out: Option<String>,
     input_test: bool,
+    feat_screen: bool,
+    feat_clipboard: bool,
+    feat_verify: bool,
 }
 
 fn parse_args() -> Args {
@@ -51,6 +54,9 @@ fn parse_args() -> Args {
         seconds: None,
         out: None,
         input_test: false,
+        feat_screen: false,
+        feat_clipboard: false,
+        feat_verify: false,
     };
     let mut i = 1;
     while i < raw.len() {
@@ -59,6 +65,9 @@ fn parse_args() -> Args {
             "--usb" => a.usb = true,
             "--remote" => a.remote = true,
             "--input-test" => a.input_test = true,
+            "--screen" => a.feat_screen = true,
+            "--clipboard" => a.feat_clipboard = true,
+            "--verify" => a.feat_verify = true,
             "--phone" => {
                 i += 1;
                 a.phone = raw.get(i).cloned();
@@ -94,7 +103,9 @@ fn print_help() {
          pcsuite screen --phone <IP> [--reg-ip <IP>] [--data-ip <IP>] [--remote] \
          [--seconds <N>] [--out <file.h265>] [--input-test]\n  \
          pcsuite clipboard --usb [--seconds <N>]   (text sync; --seconds 0 = forever)\n  \
-         pcsuite verify-code --usb [--seconds <N>] (SMS code relay → clipboard)\n\n\
+         pcsuite verify-code --usb [--seconds <N>] (SMS code relay → clipboard)\n  \
+         pcsuite all --usb [--screen|--clipboard|--verify] [--seconds <N>] [--out <f>]\n\
+         \x20                                       (all features on one connection; default = all)\n\n\
          Gets a token onto the phone (USB adb, or LAN ConnectFlow), opens the\n\
          screen-mirror data plane, and counts frames (or dumps raw HEVC with --out).\n\
          --input-test scrolls the phone centre to verify mouse/scroll injection."
@@ -116,6 +127,7 @@ async fn main() -> Result<()> {
         "screen" => cmd_screen(args).await,
         "clipboard" => cmd_clipboard(args).await,
         "verify-code" => cmd_verify(args).await,
+        "all" => cmd_all(args).await,
         "" | "help" | "-h" | "--help" => {
             print_help();
             Ok(())
@@ -348,4 +360,108 @@ fn copy_to_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+/// Unified session: screen + clipboard + verify-code over one control connection.
+async fn cmd_all(args: Args) -> Result<()> {
+    if !args.usb {
+        anyhow::bail!("`all` currently supports --usb only");
+    }
+    // default to every feature when none is explicitly requested
+    let any = args.feat_screen || args.feat_clipboard || args.feat_verify;
+    let (do_screen, do_clip, do_verify) = if any {
+        (args.feat_screen, args.feat_clipboard, args.feat_verify)
+    } else {
+        (true, true, true)
+    };
+    let identity = config::default_identity();
+    tracing::info!(screen = do_screen, clipboard = do_clip, verify = do_verify, "pcsuite all — USB (adb)");
+
+    let usb_session = usb::prepare(UsbConfig::default()).await?;
+    if do_clip {
+        pcsuite_core::adb::run_ok(&usb_session.adb, &["reverse", "tcp:8904", "tcp:8904"]).await;
+    }
+
+    let mut session = Session::connect("127.0.0.1", &usb_session.token).await?;
+
+    if do_verify {
+        session.enable_verify(|code, sign| {
+            println!("★ SMS code: {code}  (from: {sign})");
+            copy_to_clipboard(code);
+        });
+    }
+    if do_clip {
+        let cfg = ClipboardConfig {
+            data_ip: "127.0.0.1".into(),
+            pc_ip: "127.0.0.1".into(),
+            bind_addr: "127.0.0.1".into(),
+            token: usb_session.token.clone(),
+            open_id: identity.open_id.clone(),
+            device_name: identity.device_name.clone(),
+            connect_type: "USB".into(),
+        };
+        session.enable_clipboard(cfg, Arc::new(MacClipboard)).await?;
+    }
+
+    println!(
+        "🚀 unified session running ({}{}{}) — Ctrl-C to stop.",
+        if do_screen { "screen " } else { "" },
+        if do_clip { "clipboard " } else { "" },
+        if do_verify { "verify-code" } else { "" }
+    );
+
+    let result: Result<()> = if do_screen {
+        let mut stream = session.enable_screen(ScreenParams::default()).await?;
+        let mut out = match &args.out {
+            Some(p) => Some(std::fs::File::create(p)?),
+            None => None,
+        };
+        let seconds = args.seconds.unwrap_or(0.0);
+        let t0 = Instant::now();
+        let limit = (seconds > 0.0).then(|| Duration::from_secs_f64(seconds));
+        let mut frames = 0u64;
+        loop {
+            if let Some(lim) = limit {
+                if t0.elapsed() >= lim {
+                    break;
+                }
+            }
+            let next = match limit {
+                Some(lim) => {
+                    let remaining = lim.saturating_sub(t0.elapsed()).max(Duration::from_millis(1));
+                    match tokio::time::timeout(remaining, stream.next_frame()).await {
+                        Ok(f) => f,
+                        Err(_) => break,
+                    }
+                }
+                None => stream.next_frame().await,
+            };
+            let Some(frame) = next else { break };
+            frames += 1;
+            if let Some(f) = out.as_mut() {
+                use std::io::Write;
+                f.write_all(&frame)?;
+            }
+            if frames % 60 == 0 {
+                tracing::info!(frames, "…streaming");
+            }
+        }
+        tracing::info!(frames, "screen stream ended");
+        Ok(())
+    } else {
+        let seconds = args.seconds.unwrap_or(0.0);
+        if seconds > 0.0 {
+            tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        Ok(())
+    };
+
+    drop(session); // aborts all feature tasks
+    if do_clip {
+        pcsuite_core::adb::run_ok(&usb_session.adb, &["reverse", "--remove", "tcp:8904"]).await;
+    }
+    usb::cleanup(&usb_session.adb).await;
+    result
 }

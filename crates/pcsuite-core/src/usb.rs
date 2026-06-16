@@ -71,6 +71,9 @@ pub async fn prepare(cfg: UsbConfig) -> Result<UsbSession> {
     if !connected {
         bail!("no adb device in 'device' state — plug in USB + authorize debugging:\n{devices}");
     }
+    // A long-running phone app can wedge and stop listening on 10380; force-stop
+    // it so `am start` below relaunches a clean instance.
+    adb::run_ok(&adb, &["shell", "am", "force-stop", "com.vivo.pcsuite"]).await;
     tracing::info!("adb device connected; forwarding 10380/10381");
 
     adb::run(&adb, &["forward", "tcp:10380", "tcp:10380"]).await?;

@@ -32,6 +32,11 @@ pub struct InputHandle {
 }
 
 impl InputHandle {
+    /// Wrap a raw sender (used by the unified session).
+    pub(crate) fn from_sender(tx: mpsc::Sender<String>) -> Self {
+        Self { tx }
+    }
+
     /// Send a mouse event (down/up/move, left/right).
     pub async fn mouse(
         &self,
@@ -185,7 +190,7 @@ async fn control_loop(mut ws: WsClient<Tls>) {
 }
 
 /// Read mirror frames, strip the optional `FRAME:` prefix, push to the channel.
-async fn video_loop(mut ws: WsClient<Tls>, tx: mpsc::Sender<Vec<u8>>) {
+pub(crate) async fn video_loop(mut ws: WsClient<Tls>, tx: mpsc::Sender<Vec<u8>>) {
     loop {
         match ws.recv().await {
             Ok(WsFrame::Binary(b)) => {
@@ -207,7 +212,7 @@ async fn video_loop(mut ws: WsClient<Tls>, tx: mpsc::Sender<Vec<u8>>) {
 
 /// Forward queued input messages and ping every 2s so the idle handler doesn't
 /// drop the channel. Never reads incoming (we only need to send here).
-async fn input_loop(mut ws: WsClient<Tls>, mut rx: mpsc::Receiver<String>) {
+pub(crate) async fn input_loop(mut ws: WsClient<Tls>, mut rx: mpsc::Receiver<String>) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
