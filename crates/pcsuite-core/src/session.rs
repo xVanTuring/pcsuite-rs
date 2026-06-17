@@ -16,6 +16,7 @@ use tokio::time::timeout;
 use pcsuite_net::tcp;
 use pcsuite_net::ws::{WsClient, WsFrame};
 use pcsuite_proto::clip::{self, PcInfo};
+use pcsuite_proto::PcIdentity;
 use pcsuite_proto::screen as screenmsg;
 use pcsuite_proto::screen::ScreenParams;
 
@@ -96,6 +97,62 @@ impl Session {
     /// A clone of the control handle.
     pub fn control(&self) -> ControlHandle {
         self.control.clone()
+    }
+
+    /// Discover the connected phone's `mobileDeviceId` (and its vdfs session key/iv)
+    /// by sending a SHADOW_LIKE `startup` and reading the phone's announcement. These
+    /// are the routing inputs for the mdfs file API ([`crate::mdfs`]) and the vdfs
+    /// download plane. Only `startup` is sent (no `ready`), so the phone does not
+    /// reverse-connect to the 8904 relay — this is safe for a browse-only session.
+    pub async fn phone_info(
+        &self,
+        pc_ip: &str,
+        connect_type: &str,
+        identity: &PcIdentity,
+    ) -> Result<clip::PhoneSession> {
+        let mut rx = self.control.subscribe();
+        let (key, iv) = clipboard::rand_clip_keys();
+        let pcinfo = PcInfo {
+            ip: pc_ip,
+            pc_device_id: config::CLIP_PC_ID,
+            pc_device_name: &identity.device_name,
+            key: &key,
+            iv: &iv,
+            account_open_id: &identity.open_id,
+            account_name: config::CLIP_NICK,
+            connect_type,
+        };
+        self.control.send(clip::shadow_startup(&pcinfo, 8904, 5679)).await?;
+
+        // The phone may have announced before we subscribed; the session retains it.
+        if let Some(sess) = self
+            .control
+            .last_shadow()
+            .as_deref()
+            .and_then(clip::parse_shadow_reply)
+            .filter(|s| !s.mobile_device_id.is_empty())
+        {
+            return Ok(sess);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("no phone SHADOW info within 10s (is the device connected?)");
+            }
+            match timeout(remaining, rx.recv()).await {
+                Ok(Ok(text)) => {
+                    if let Some(sess) =
+                        clip::parse_shadow_reply(&text).filter(|s| !s.mobile_device_id.is_empty())
+                    {
+                        return Ok(sess);
+                    }
+                }
+                Ok(Err(_)) => anyhow::bail!("control channel closed before phone info"),
+                Err(_) => anyhow::bail!("timeout waiting for phone info"),
+            }
+        }
     }
 
     /// Enable SMS verify-code relay.

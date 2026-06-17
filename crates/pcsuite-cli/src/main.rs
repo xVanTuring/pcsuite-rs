@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    config, register, run_clipboard, run_verify, usb, ClipboardBackend, ClipboardConfig,
-    RegisterConfig, Registration, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
+    config, mdfs, register, run_clipboard, run_verify, usb, ClipboardBackend, ClipboardConfig,
+    ListKind, RegisterConfig, Registration, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
 };
 
 struct Args {
@@ -40,6 +40,10 @@ struct Args {
     feat_screen: bool,
     feat_clipboard: bool,
     feat_verify: bool,
+    /// `ls` category: recent|image|video|audio|file|doc|home.
+    list_type: Option<String>,
+    /// `pull` phone-side absolute path.
+    path: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -58,6 +62,8 @@ fn parse_args() -> Args {
         feat_screen: false,
         feat_clipboard: false,
         feat_verify: false,
+        list_type: None,
+        path: None,
     };
     let mut i = 1;
     while i < raw.len() {
@@ -89,6 +95,14 @@ fn parse_args() -> Args {
                 i += 1;
                 a.out = raw.get(i).cloned();
             }
+            "--type" => {
+                i += 1;
+                a.list_type = raw.get(i).cloned();
+            }
+            "--path" => {
+                i += 1;
+                a.path = raw.get(i).cloned();
+            }
             _ => {}
         }
         i += 1;
@@ -105,6 +119,8 @@ fn print_help() {
          [--seconds <N>] [--out <file.h265>] [--input-test]\n  \
          pcsuite clipboard  (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite verify-code (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
+         pcsuite ls (--usb | --phone <IP> [--remote]) [--type recent|image|video|audio|file|doc|home]\n  \
+         pcsuite pull (--usb | --phone <IP> [--remote]) --path <phone-path> [--out <file>]\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify] \
          [--seconds <N>] [--out <f>]\n\
          \x20                                       (clipboard+verify in the background; type\n\
@@ -132,6 +148,8 @@ async fn main() -> Result<()> {
         "screen" => cmd_screen(args).await,
         "clipboard" => cmd_clipboard(args).await,
         "verify-code" => cmd_verify(args).await,
+        "ls" => cmd_ls(args).await,
+        "pull" => cmd_pull(args).await,
         "all" => cmd_all(args).await,
         "" | "help" | "-h" | "--help" => {
             print_help();
@@ -495,6 +513,83 @@ fn copy_to_clipboard(text: &str) {
             let _ = stdin.write_all(text.as_bytes());
         }
         let _ = child.wait();
+    }
+}
+
+/// Browse a phone file/media category over the mdfs HTTP API (10380). Opens the
+/// control session (to learn the phone's `mobileDeviceId`), then lists.
+async fn cmd_ls(args: Args) -> Result<()> {
+    let identity = config::default_identity();
+    let kind = match args.list_type.as_deref() {
+        Some(s) => ListKind::parse(s)
+            .with_context(|| format!("unknown --type {s:?} (recent|image|video|audio|file|doc|home)"))?,
+        None => ListKind::Recent,
+    };
+
+    let t = resolve_transport(&args, "ls").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+    tracing::info!(device = %phone.mobile_device_id, name = %phone.mobile_device_name, "phone session resolved");
+
+    let result = mdfs::list(&t.data_ip, &t.token, &phone.mobile_device_id, kind, 500).await;
+    drop(session);
+    cleanup_transport(&t, false).await;
+
+    let entries = result?;
+    println!("📂 {:?} — {} item(s) on {}", kind, entries.len(), phone.mobile_device_name);
+    for e in &entries {
+        let tag = if e.is_dir { "d" } else { "-" };
+        let extra = if e.duration_ms > 0 {
+            format!("  [{}s]", e.duration_ms / 1000)
+        } else {
+            String::new()
+        };
+        println!("{tag} {:>9}  {}{}", human_size(e.size), e.path, extra);
+    }
+    Ok(())
+}
+
+/// Download one phone file by path over the mdfs HTTP plane (`download_info` +
+/// `download` tar stream on 10380) — the desktop app's path, which works without the
+/// vdfs (5678) serving gate.
+async fn cmd_pull(args: Args) -> Result<()> {
+    let identity = config::default_identity();
+    let path = args.path.clone().context("--path <phone-path> is required")?;
+
+    let t = resolve_transport(&args, "pull").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+    tracing::info!(device = %phone.mobile_device_id, %path, "pulling");
+
+    let fetched = mdfs::download(&t.data_ip, &t.token, &phone.mobile_device_id, &path).await;
+    drop(session);
+    cleanup_transport(&t, false).await;
+
+    let bytes = fetched?;
+    let out = args.out.clone().unwrap_or_else(|| {
+        std::path::Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "pulled.bin".into())
+    });
+    std::fs::write(&out, &bytes).with_context(|| format!("write {out}"))?;
+    println!("✅ pulled {} → {out} ({} bytes)", path, bytes.len());
+    Ok(())
+}
+
+/// Human-readable byte count.
+fn human_size(n: u64) -> String {
+    const U: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < U.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", U[i])
     }
 }
 
