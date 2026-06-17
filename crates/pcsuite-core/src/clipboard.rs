@@ -156,6 +156,17 @@ fn preview(s: &str) -> String {
     s.chars().take(40).collect()
 }
 
+/// Extract a string-valued JSON field (`"key":"value"`) by simple scan. Good enough
+/// for the controlled byteC=8 task envelopes; not a general JSON parser.
+#[allow(dead_code)] // used by the byteC=8 record-response parser (WIP)
+fn extract_json_str(s: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\":\"");
+    let i = s.find(&pat)? + pat.len();
+    let rest = &s[i..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 /// Run the clipboard relay until the control WS closes.
 pub async fn run_clipboard(cfg: ClipboardConfig, backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     let pc_key = rand_chars(32);
@@ -288,6 +299,77 @@ async fn handle_8904(stream: TcpStream, shared: SharedRef, backend: Arc<dyn Clip
         tx.send(f1).await.ok();
         tx.send(f2).await.ok();
         tracing::info!("8904 handshake sent (command 1 + 5)");
+
+        // opt-in: send a byteC=8 MediaStore sync request to try to pull the index.
+        // Type/byteD overridable via env so we can probe without rebuilding.
+        if std::env::var_os("PCSUITE_SYNC_REQ").is_some() {
+            let ty: i64 = std::env::var("PCSUITE_SYNC_TYPE").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+            let byte_d: u8 = std::env::var("PCSUITE_SYNC_BYTED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let task_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+            let inner = format!(
+                r#"{{"sourceDeviceId":"{pc_id}","targetDeviceId":"{phone_id}","lastReceiveVersion":0,"modifiedTime":0,"syncTag":"{task_id}","syncedPublicDataCount":0,"syncedMaxPublicDataFilesId":0,"pubVersion":0}}"#
+            );
+            let inner_esc = inner.replace('\\', "\\\\").replace('"', "\\\"");
+            let task = format!(r#"[{{"data":"{inner_esc}","taskId":"{task_id}","type":{ty}}}]"#);
+            match gcm_encrypt(task.as_bytes(), pc_key.as_bytes(), pc_iv.as_bytes(), b"") {
+                Ok(cipher) => {
+                    let frame = RuyingFrame {
+                        version: ruying::VERSION,
+                        field_a: pad6(&phone_id),
+                        field_b: pad6(pc_id),
+                        byte_c: 8,
+                        byte_d,
+                        field_e: *b"00000000000",
+                        cipher,
+                    };
+                    tx.send(frame.build()).await.ok();
+                    tracing::info!(ty, byte_d, req = %task, "[sync] sent byteC=8 sync request");
+                }
+                Err(e) => tracing::warn!(err = %e, "[sync] encrypt failed"),
+            }
+        }
+    }
+
+    // opt-in on-demand vdfs browse/download test: proves list/stat/read work any
+    // time the session is up (no image-copy trigger). PCSUITE_BROWSE=<path>[;<path>],
+    // PCSUITE_PULL=<remote file> downloads to /tmp/pull_<name>.
+    if let Ok(spec) = std::env::var("PCSUITE_BROWSE") {
+        let (pk, piv, pid, fhost, fport) = {
+            let sh = shared.lock().await;
+            (sh.phone_key.clone(), sh.phone_iv.clone(), sh.phone_id.clone(), sh.fetch_host.clone(), sh.fetch_port)
+        };
+        if let (Some(pk), Some(piv)) = (pk, piv) {
+            for path in spec.split(';').filter(|s| !s.is_empty()) {
+                match vdfs::list_dir(&fhost, fport, &pk, &piv, &pid, path).await {
+                    Ok(entries) => {
+                        let dirs = entries.iter().filter(|e| e.is_dir()).count();
+                        let files = entries.iter().filter(|e| e.is_file()).count();
+                        tracing::info!(%path, n = entries.len(), dirs, files, "[browse] list_dir OK");
+                        for e in entries.iter().take(40) {
+                            let kind = if e.is_dir() { "DIR " } else { "FILE" };
+                            let full = format!("{}/{}", path.trim_end_matches('/'), e.name);
+                            let sz = if e.is_file() {
+                                vdfs::stat(&fhost, fport, &pk, &piv, &pid, &full).await.map(|s| s.size as i64).unwrap_or(-1)
+                            } else { -1 };
+                            tracing::info!("[browse]   {kind} {sz:>11}  {}", e.name);
+                        }
+                    }
+                    Err(e) => tracing::warn!(err = %e, %path, "[browse] list_dir FAILED"),
+                }
+            }
+            if let Ok(rp) = std::env::var("PCSUITE_PULL") {
+                match vdfs::fetch(&fhost, fport, &pk, &piv, &pid, &rp).await {
+                    Ok(bytes) => {
+                        let out = format!("/tmp/pull_{}", rp.rsplit('/').next().unwrap_or("file"));
+                        let _ = std::fs::write(&out, &bytes);
+                        tracing::info!(n = bytes.len(), %out, "[browse] download OK");
+                    }
+                    Err(e) => tracing::warn!(err = %e, %rp, "[browse] download FAILED"),
+                }
+            }
+        } else {
+            tracing::warn!("[browse] no phone key yet");
+        }
     }
 
     // read loop
@@ -385,7 +467,65 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
             }
         }
         100 => tracing::debug!(cmd = %preview(&text), "[phone] command frame"),
-        _ => {} // byteC=8 (vdfs) / 101 (heartbeat) ignored for text relay
+        8 => {
+            // byteC=8 = MediaStore index (the data behind the original's file page).
+            // Opt-in dump (PCSUITE_INDEX_DUMP=1) so we can reverse its format.
+            if std::env::var_os("PCSUITE_INDEX_DUMP").is_some() {
+                use std::io::Write;
+                let path = "/tmp/vdfs_index_dump.bin";
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = f.write_all(&plain);
+                }
+                let head: String = text.chars().take(160).collect();
+                tracing::info!(
+                    len = plain.len(), byte_d = frame.byte_d,
+                    field_a = %hex::encode(frame.field_a), field_b = %hex::encode(frame.field_b),
+                    field_e = ?String::from_utf8_lossy(&frame.field_e),
+                    head = %head, "[index] byteC=8 frame → {path}"
+                );
+            }
+            // Respond to the phone's type-10005 sync beacon with a SyncRequestBean,
+            // reusing the beacon's taskId (correlation). Knobs via env.
+            if std::env::var_os("PCSUITE_SYNC_REPLY").is_some() && text.contains("\"type\":10005") {
+                {
+                    let (pc_key, pc_iv, phone_id, out) = {
+                        let sh = shared.lock().await;
+                        (sh.pc_key.clone(), sh.pc_iv.clone(), sh.phone_id.clone(), sh.outgoing.clone())
+                    };
+                    let pc_id = config::CLIP_PC_ID;
+                    // Reversed from vivorelay Database_operations::SyncRequestBean + GetFormatData:
+                    // on the phone's type-10005 beacon, the PC replies with a fresh-UUID envelope
+                    // of type 1000 carrying the 8-field sync state (full sync = all zero/empty).
+                    let ty: i64 = std::env::var("PCSUITE_SYNC_TYPE").ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
+                    let byte_d: u8 = std::env::var("PCSUITE_SYNC_BYTED").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    // syncTag MUST be a fresh UUID (empty "" is treated as no-op by the phone);
+                    // the session's envelope taskId == syncTag (confirmed from the original's relay.log).
+                    let task_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+                    let inner = format!(
+                        r#"{{"sourceDeviceId":"{pc_id}","targetDeviceId":"{phone_id}","lastReceiveVersion":0,"modifiedTime":0,"syncTag":"{task_id}","syncedPublicDataCount":0,"syncedMaxPublicDataFilesId":0,"pubVersion":0}}"#
+                    );
+                    let inner = if std::env::var_os("PCSUITE_SYNC_ARR").is_some() { format!("[{inner}]") } else { inner };
+                    let inner_esc = inner.replace('\\', "\\\\").replace('"', "\\\"");
+                    let task = format!(r#"[{{"data":"{inner_esc}","taskId":"{task_id}","type":{ty}}}]"#);
+                    if let (Some(out), Ok(cipher)) =
+                        (out, gcm_encrypt(task.as_bytes(), pc_key.as_bytes(), pc_iv.as_bytes(), b""))
+                    {
+                        let frame = RuyingFrame {
+                            version: ruying::VERSION,
+                            field_a: pad6(&phone_id),
+                            field_b: pad6(pc_id),
+                            byte_c: 8,
+                            byte_d,
+                            field_e: *b"00000000000",
+                            cipher,
+                        };
+                        let _ = out.send(frame.build()).await;
+                        tracing::info!(ty, byte_d, %task_id, "[sync] replied to 10005 beacon");
+                    }
+                }
+            }
+        }
+        _ => {} // 101 (heartbeat) etc. ignored for text relay
     }
 }
 
