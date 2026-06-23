@@ -48,6 +48,17 @@ mod ffi {
         // this PcScreen. Lets Swift tear mirroring down without dropping the handle
         // out from under a parked next_frame() call.
         fn stop(&self);
+        // Block for the next privacy / secure-screen event. Returns one of
+        // "clear" (back to a normal screen), "password", "safety" (FLAG_SECURE,
+        // e.g. fingerprint), or "lockScreen". Returns "" when the stream ends or
+        // stop() is called. Loop this on a background thread: when the phone hits
+        // a secure surface it stops the video, so show a "handle on phone" hint.
+        fn next_privacy_event(&self) -> String;
+        // Block for the next IME caret report from the phone, as "x,y" (caret
+        // position in the mirror's pixel space) or "off" (focused field went
+        // away). Returns "" when the stream ends / stop() is called. Use it to
+        // place the PC's IME candidate window at the on-device caret.
+        fn next_input_cursor(&self) -> String;
     }
 
     extern "Rust" {
@@ -77,6 +88,13 @@ mod ffi {
         fn mouse(&self, action: u8, button: u8, x: i64, y: i64, w: i64, h: i64) -> bool;
         // Inject a scroll. vscroll > 0 up, < 0 down.
         fn scroll(&self, vscroll: i64, x: i64, y: i64, w: i64, h: i64) -> bool;
+        // Commit text into the phone's focused input field (IME commitText).
+        // Carries full Unicode (Chinese/emoji) — the path for keyboard typing.
+        // Needs start_screen() first (shares its /mirror/control channel).
+        fn text(&self, s: String) -> bool;
+        // Delete `before` chars before and `after` chars after the cursor
+        // (IME deleteSurroundingText) — used for Backspace.
+        fn delete_surrounding(&self, before: i64, after: i64) -> bool;
         // Tap (down+up, left button) at (x, y) in the reference frame (w, h).
         fn tap(&self, x: i64, y: i64, w: i64, h: i64) -> bool;
         // Press an Android key (down+up). keycode is a KEYCODE_* value, e.g.
@@ -144,8 +162,13 @@ pub struct PcSession {
 /// (or drop it) to stop.
 pub struct PcScreen {
     frames: tokio::sync::Mutex<ScreenStream>,
-    // Set by stop(); next_frame() observes it between short recv timeouts and
-    // returns an empty Vec so the polling thread breaks and drops this PcScreen.
+    // Privacy/secure-screen events, polled on a thread separate from frames so
+    // the two blocking pollers never contend for one lock.
+    events: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>,
+    // IME caret reports, polled on its own thread for the same reason.
+    cursor: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<String>>,
+    // Set by stop(); the next_*() pollers observe it between short recv timeouts
+    // and return empty so the polling threads break and drop this.
     stop: std::sync::atomic::AtomicBool,
 }
 
@@ -172,6 +195,42 @@ impl PcScreen {
     fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+
+    fn next_privacy_event(&self) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        rt().block_on(async {
+            let mut events = self.events.lock().await;
+            loop {
+                if self.stop.load(Ordering::Relaxed) {
+                    return String::new();
+                }
+                match tokio::time::timeout(Duration::from_millis(300), events.recv()).await {
+                    Ok(Some(tok)) => return tok,    // a privacy state token
+                    Ok(None) => return String::new(), // channel closed (stream ended)
+                    Err(_) => continue,             // timeout -> re-check stop
+                }
+            }
+        })
+    }
+
+    fn next_input_cursor(&self) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        rt().block_on(async {
+            let mut cursor = self.cursor.lock().await;
+            loop {
+                if self.stop.load(Ordering::Relaxed) {
+                    return String::new();
+                }
+                match tokio::time::timeout(Duration::from_millis(300), cursor.recv()).await {
+                    Ok(Some(s)) => return s,        // "x,y" or "off"
+                    Ok(None) => return String::new(),
+                    Err(_) => continue,
+                }
+            }
+        })
+    }
 }
 
 impl PcSession {
@@ -180,15 +239,19 @@ impl PcSession {
         if max_size > 0 {
             params.max_size = max_size;
         }
-        let stream = rt()
+        let mut stream = rt()
             .block_on(async {
                 let mut s = self.session.lock().await;
                 s.enable_screen(params).await
             })
             .map_err(|e| format!("{e:#}"))?;
         *self.input.lock().unwrap() = stream.input();
+        let events = stream.take_events();
+        let cursor = stream.take_cursor();
         Ok(PcScreen {
             frames: tokio::sync::Mutex::new(stream),
+            events: tokio::sync::Mutex::new(events),
+            cursor: tokio::sync::Mutex::new(cursor),
             stop: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -283,6 +346,20 @@ impl PcSession {
             return false;
         };
         rt().block_on(input.scroll(vscroll, x, y, w, h)).is_ok()
+    }
+
+    fn text(&self, s: String) -> bool {
+        let Some(input) = self.input.lock().unwrap().clone() else {
+            return false;
+        };
+        rt().block_on(input.text(&s)).is_ok()
+    }
+
+    fn delete_surrounding(&self, before: i64, after: i64) -> bool {
+        let Some(input) = self.input.lock().unwrap().clone() else {
+            return false;
+        };
+        rt().block_on(input.delete_surrounding(before, after)).is_ok()
     }
 
     fn tap(&self, x: i64, y: i64, w: i64, h: i64) -> bool {

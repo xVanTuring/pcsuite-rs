@@ -243,7 +243,7 @@ impl Session {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
         let mut tasks = vec![tokio::spawn(crate::screen::video_loop(video, tx))];
 
-        let input = match open_ws(
+        let (input, events, cursor) = match open_ws(
             &self.data_ip,
             10381,
             "/mirror/control",
@@ -255,19 +255,21 @@ impl Session {
         {
             Ok(ws) => {
                 tracing::info!("control-input WS 101 (/mirror/control)");
-                let (itx, irx) = mpsc::channel::<String>(64);
-                tasks.push(tokio::spawn(crate::screen::input_loop(ws, irx)));
-                Some(InputHandle::from_sender(itx))
+                let ic = crate::screen::setup_input(ws);
+                tasks.extend(ic.tasks);
+                (Some(ic.handle), ic.events, ic.cursor)
             }
             Err(e) => {
                 tracing::warn!(err = %e, "control-input channel unavailable (view-only)");
-                None
+                (None, crate::screen::closed_events(), crate::screen::closed_events())
             }
         };
 
         Ok(ScreenStream {
             frames: rx,
             input,
+            events,
+            cursor,
             tasks,
         })
     }
@@ -277,6 +279,8 @@ impl Session {
 pub struct ScreenStream {
     frames: mpsc::Receiver<Vec<u8>>,
     input: Option<InputHandle>,
+    events: mpsc::Receiver<String>,
+    cursor: mpsc::Receiver<String>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -296,6 +300,21 @@ impl ScreenStream {
     /// A cloneable input handle, if the control-input channel opened.
     pub fn input(&self) -> Option<InputHandle> {
         self.input.clone()
+    }
+    /// Await the next privacy/secure-screen event token (e.g. `password`,
+    /// `safety`, `lockScreen`, `clear`), or `None` once the channel ends.
+    pub async fn next_event(&mut self) -> Option<String> {
+        self.events.recv().await
+    }
+    /// Take ownership of the privacy-event receiver (leaving a closed one), so a
+    /// caller can poll privacy events on a thread separate from frame polling
+    /// without the two contending for one lock.
+    pub fn take_events(&mut self) -> mpsc::Receiver<String> {
+        std::mem::replace(&mut self.events, crate::screen::closed_events())
+    }
+    /// Take ownership of the IME-caret receiver (leaving a closed one).
+    pub fn take_cursor(&mut self) -> mpsc::Receiver<String> {
+        std::mem::replace(&mut self.cursor, crate::screen::closed_events())
     }
 }
 

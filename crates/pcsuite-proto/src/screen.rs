@@ -78,6 +78,51 @@ pub fn strip_frame_prefix(payload: &[u8]) -> &[u8] {
     }
 }
 
+/// Privacy / secure-screen state the phone reports via `NOTIFY_PASS:`. When the
+/// phone shows a secure surface (fingerprint, password entry, lock screen) it
+/// stops the mirror stream and sends this so the PC can show a "handle on phone"
+/// prompt instead of a frozen / black picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivacyState {
+    /// Back to a normal, mirrorable screen.
+    Clear,
+    /// A password / PIN entry surface.
+    Password,
+    /// A `FLAG_SECURE` window (e.g. fingerprint, banking, DRM).
+    Secure,
+    /// The device lock screen.
+    LockScreen,
+}
+
+impl PrivacyState {
+    /// Stable wire token used across the FFI boundary (matches the phone's
+    /// `privacyState` strings; `Clear` collapses the "not secure" cases).
+    pub fn token(self) -> &'static str {
+        match self {
+            PrivacyState::Clear => "clear",
+            PrivacyState::Password => "password",
+            PrivacyState::Secure => "safety",
+            PrivacyState::LockScreen => "lockScreen",
+        }
+    }
+}
+
+/// Parse a `NOTIFY_PASS:{…}` control message into a [`PrivacyState`].
+/// Returns `None` for any other message. `isPass=false` → [`PrivacyState::Clear`].
+pub fn parse_notify_pass(line: &str) -> Option<PrivacyState> {
+    let body = line.strip_prefix("NOTIFY_PASS:")?;
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if !v.get("isPass").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return Some(PrivacyState::Clear);
+    }
+    Some(match v.get("privacyState").and_then(|x| x.as_str()).unwrap_or("") {
+        "password" => PrivacyState::Password,
+        "lockScreen" => PrivacyState::LockScreen,
+        // "safety" or any other non-empty state under isPass=true → treat as secure.
+        _ => PrivacyState::Secure,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +148,26 @@ mod tests {
         assert_eq!(strip_frame_prefix(b"FRAME:abc"), b"abc");
         assert_eq!(strip_frame_prefix(b"abc"), b"abc");
         assert_eq!(strip_frame_prefix(b"FRAME:"), b"");
+    }
+
+    #[test]
+    fn notify_pass_parse() {
+        assert_eq!(parse_notify_pass("MOUSE_EVENT:{}"), None);
+        assert_eq!(
+            parse_notify_pass(r#"NOTIFY_PASS:{"appName":"x","isPass":false,"privacyState":""}"#),
+            Some(PrivacyState::Clear)
+        );
+        assert_eq!(
+            parse_notify_pass(r#"NOTIFY_PASS:{"isPass":true,"privacyState":"password"}"#),
+            Some(PrivacyState::Password)
+        );
+        assert_eq!(
+            parse_notify_pass(r#"NOTIFY_PASS:{"isPass":true,"privacyState":"safety"}"#),
+            Some(PrivacyState::Secure)
+        );
+        assert_eq!(
+            parse_notify_pass(r#"NOTIFY_PASS:{"isPass":true,"privacyState":"lockScreen"}"#),
+            Some(PrivacyState::LockScreen)
+        );
     }
 }

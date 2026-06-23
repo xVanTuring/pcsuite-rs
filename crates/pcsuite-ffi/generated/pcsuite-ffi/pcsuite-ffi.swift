@@ -44,6 +44,14 @@ extension PcScreenRef {
     public func stop() {
         __swift_bridge__$PcScreen$stop(ptr)
     }
+
+    public func next_privacy_event() -> RustString {
+        RustString(ptr: __swift_bridge__$PcScreen$next_privacy_event(ptr))
+    }
+
+    public func next_input_cursor() -> RustString {
+        RustString(ptr: __swift_bridge__$PcScreen$next_input_cursor(ptr))
+    }
 }
 extension PcScreen: Vectorizable {
     public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
@@ -147,6 +155,14 @@ extension PcSessionRef {
 
     public func scroll(_ vscroll: Int64, _ x: Int64, _ y: Int64, _ w: Int64, _ h: Int64) -> Bool {
         __swift_bridge__$PcSession$scroll(ptr, vscroll, x, y, w, h)
+    }
+
+    public func text<GenericIntoRustString: IntoRustString>(_ s: GenericIntoRustString) -> Bool {
+        __swift_bridge__$PcSession$text(ptr, { let rustString = s.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+    }
+
+    public func delete_surrounding(_ before: Int64, _ after: Int64) -> Bool {
+        __swift_bridge__$PcSession$delete_surrounding(ptr, before, after)
     }
 
     public func tap(_ x: Int64, _ y: Int64, _ w: Int64, _ h: Int64) -> Bool {

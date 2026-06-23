@@ -9,7 +9,7 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use rand::RngCore;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 
 /// A decoded WebSocket frame.
 #[derive(Debug)]
@@ -32,13 +32,24 @@ pub struct WsClient<S> {
     stream: S,
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
+impl<S> WsClient<S> {
     pub fn new(stream: S) -> Self {
         Self { stream }
     }
 
     pub fn into_inner(self) -> S {
         self.stream
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
+    /// Split into independent read and write halves so one task can block on
+    /// [`WsClient::recv`] (which is *not* cancellation-safe) while another sends
+    /// frames concurrently. Used by the `/mirror/control` channel, which both
+    /// injects input (write) and receives `NOTIFY_PASS` privacy events (read).
+    pub fn split(self) -> (WsClient<ReadHalf<S>>, WsClient<WriteHalf<S>>) {
+        let (r, w) = tokio::io::split(self.stream);
+        (WsClient::new(r), WsClient::new(w))
     }
 
     /// Perform the HTTP/1.1 upgrade with the phone's custom headers. Returns the
@@ -82,7 +93,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
         let head = String::from_utf8_lossy(&buf);
         Ok(head.lines().next().unwrap_or("").to_string())
     }
+}
 
+impl<S: AsyncWrite + Unpin> WsClient<S> {
     async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
         let n = payload.len();
         let mut header = Vec::with_capacity(14);
@@ -123,7 +136,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
     pub async fn send_ping(&mut self) -> std::io::Result<()> {
         self.send_frame(0x9, &[]).await
     }
+}
 
+impl<S: AsyncRead + Unpin> WsClient<S> {
     /// Read one frame. Unfragmented frames only (the phone never fragments);
     /// a continuation opcode is surfaced as `Binary`.
     pub async fn recv(&mut self) -> std::io::Result<WsFrame> {
