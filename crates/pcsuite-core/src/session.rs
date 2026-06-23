@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -59,6 +59,13 @@ pub struct Session {
     data_ip: String,
     token: String,
     tasks: Vec<JoinHandle<()>>,
+    /// Flips to `true` when the control WS owner task exits (peer closed, read/write
+    /// error, or keepalive send failure) — i.e. the connection is gone. This is the
+    /// single, transport-agnostic liveness signal (USB and LAN both ride the one
+    /// 10380 control WS), surfaced to the app so it can reconnect. Retains its value
+    /// for late subscribers; an aborted task (intentional teardown) drops the sender
+    /// instead, which the FFI distinguishes via its own stop flag.
+    dead_rx: watch::Receiver<bool>,
 }
 
 impl Drop for Session {
@@ -85,18 +92,27 @@ impl Session {
             in_tx: in_tx.clone(),
             last_shadow: last_shadow.clone(),
         };
-        let task = tokio::spawn(control_task(ws, out_rx, in_tx, last_shadow));
+        let (dead_tx, dead_rx) = watch::channel(false);
+        let task = tokio::spawn(control_task(ws, out_rx, in_tx, last_shadow, dead_tx));
         Ok(Session {
             control,
             data_ip: data_ip.to_string(),
             token: token.to_string(),
             tasks: vec![task],
+            dead_rx,
         })
     }
 
     /// A clone of the control handle.
     pub fn control(&self) -> ControlHandle {
         self.control.clone()
+    }
+
+    /// A receiver for the session-death signal: it reads `true` once the control
+    /// WS owner task has exited (connection lost). The app polls this to drive
+    /// reconnection. Cloned so each consumer awaits independently.
+    pub fn dead_signal(&self) -> watch::Receiver<bool> {
+        self.dead_rx.clone()
     }
 
     /// Discover the connected phone's `mobileDeviceId` (and its vdfs session key/iv)
@@ -319,14 +335,19 @@ impl ScreenStream {
 }
 
 /// The control-WS owner: read+broadcast incoming, drain+send outgoing, keepalive.
+/// Every exit path means the connection is gone, so it flips `dead_tx` on the way
+/// out — the one liveness signal the app watches to reconnect. (If the task is
+/// aborted during an intentional teardown the send never runs and `dead_tx` simply
+/// drops, which the FFI watcher ignores via its own stop flag.)
 async fn control_task(
     mut ws: WsClient<Tls>,
     mut out_rx: mpsc::Receiver<String>,
     in_tx: broadcast::Sender<String>,
     last_shadow: Arc<Mutex<Option<String>>>,
+    dead_tx: watch::Sender<bool>,
 ) {
     let mut last_ka = Instant::now();
-    loop {
+    'run: loop {
         match timeout(Duration::from_millis(200), ws.recv()).await {
             Ok(Ok(WsFrame::Text(t))) => {
                 if t.starts_with("SHADOW_LIKE:") {
@@ -338,19 +359,19 @@ async fn control_task(
             }
             Ok(Ok(WsFrame::Ping(p))) => {
                 if ws.send_pong(&p).await.is_err() {
-                    break;
+                    break 'run;
                 }
             }
-            Ok(Ok(WsFrame::Close)) => break,
+            Ok(Ok(WsFrame::Close)) => break 'run,
             Ok(Ok(_)) => {}
-            Ok(Err(_)) => break,
+            Ok(Err(_)) => break 'run,
             Err(_) => {} // recv timeout -> flush outgoing + keepalive
         }
         loop {
             match out_rx.try_recv() {
                 Ok(msg) => {
                     if ws.send_text(&msg).await.is_err() {
-                        return;
+                        break 'run;
                     }
                 }
                 Err(_) => break,
@@ -358,9 +379,11 @@ async fn control_task(
         }
         if last_ka.elapsed() >= Duration::from_secs(3) {
             if ws.send_text(screenmsg::KEEPALIVE).await.is_err() {
-                break;
+                break 'run;
             }
             last_ka = Instant::now();
         }
     }
+    // Control WS is gone — report the disconnect to whoever is watching.
+    let _ = dead_tx.send(true);
 }

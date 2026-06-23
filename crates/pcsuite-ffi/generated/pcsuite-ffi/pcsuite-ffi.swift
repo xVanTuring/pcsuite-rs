@@ -149,6 +149,14 @@ extension PcSessionRef {
         __swift_bridge__$PcSession$stop_verify(ptr)
     }
 
+    public func wait_disconnect() -> RustString {
+        RustString(ptr: __swift_bridge__$PcSession$wait_disconnect(ptr))
+    }
+
+    public func stop_watch() {
+        __swift_bridge__$PcSession$stop_watch(ptr)
+    }
+
     public func mouse(_ action: UInt8, _ button: UInt8, _ x: Int64, _ y: Int64, _ w: Int64, _ h: Int64) -> Bool {
         __swift_bridge__$PcSession$mouse(ptr, action, button, x, y, w, h)
     }

@@ -83,6 +83,16 @@ mod ffi {
         // this PcSession (mirror of PcScreen::stop for the verify-code loop).
         fn stop_verify(&self);
 
+        // Block until the connection is lost (the shared 10380 control WS — used by
+        // both USB and LAN — closed or errored), returning a short reason string.
+        // Returns "" if stop_watch() was called first (intentional teardown). Loop
+        // this on a background thread: a non-empty return means the link dropped, so
+        // the app can tear down and reconnect. Covers idle and mid-mirror drops alike.
+        fn wait_disconnect(&self) -> String;
+        // Ask wait_disconnect() to return "" within ~300ms so its watcher thread can
+        // break and release this PcSession before the handle is dropped.
+        fn stop_watch(&self);
+
         // Inject a mouse event. action: 0=down,1=up,2=move. button: 1=left,2=right.
         // Coordinates are in your reference frame (w, h); the phone scales.
         fn mouse(&self, action: u8, button: u8, x: i64, y: i64, w: i64, h: i64) -> bool;
@@ -145,6 +155,10 @@ pub struct PcSession {
     verify_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     // Set by stop_verify(); the verify poller checks it between short recv timeouts.
     verify_stop: std::sync::atomic::AtomicBool,
+    // Liveness of the shared control WS; reads `true` once the connection is lost.
+    dead_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
+    // Set by stop_watch(); the disconnect watcher checks it between short timeouts.
+    watch_stop: std::sync::atomic::AtomicBool,
     token: String,
     data_ip: String,
     pc_ip: String,
@@ -325,6 +339,39 @@ impl PcSession {
         self.verify_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    fn wait_disconnect(&self) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        rt().block_on(async {
+            let mut rx = self.dead_rx.lock().await;
+            loop {
+                if self.watch_stop.load(Ordering::Relaxed) {
+                    return String::new(); // intentional teardown
+                }
+                if *rx.borrow() {
+                    return "connection lost".to_string();
+                }
+                // Short timeout so stop_watch() is noticed promptly even while the
+                // connection is still healthy and the signal hasn't changed.
+                match tokio::time::timeout(Duration::from_millis(300), rx.changed()).await {
+                    Ok(Ok(())) => {
+                        if *rx.borrow() {
+                            return "connection lost".to_string();
+                        }
+                    }
+                    // Sender dropped without flipping the flag — the session was
+                    // dropped out from under us; treat as a (benign) disconnect.
+                    Ok(Err(_)) => return "connection lost".to_string(),
+                    Err(_) => continue, // timeout -> re-check the stop flag
+                }
+            }
+        })
+    }
+
+    fn stop_watch(&self) {
+        self.watch_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn mouse(&self, action: u8, button: u8, x: i64, y: i64, w: i64, h: i64) -> bool {
         let Some(input) = self.input.lock().unwrap().clone() else {
             return false;
@@ -417,11 +464,14 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
             Ok::<_, anyhow::Error>((u, session))
         })
         .map_err(|e| format!("{e:#}"))?;
+    let dead_rx = session.dead_signal();
     Ok(PcSession {
         session: tokio::sync::Mutex::new(session),
         input: std::sync::Mutex::new(None),
         verify_rx: std::sync::Mutex::new(None),
         verify_stop: std::sync::atomic::AtomicBool::new(false),
+        dead_rx: tokio::sync::Mutex::new(dead_rx),
+        watch_stop: std::sync::atomic::AtomicBool::new(false),
         token: u.token,
         data_ip: "127.0.0.1".into(),
         pc_ip: "127.0.0.1".into(),
@@ -461,11 +511,14 @@ fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, Stri
         })
         .map_err(|e| format!("{e:#}"))?;
     let pc_ip = local_ip_toward(&phone_ip).unwrap_or_else(|| "0.0.0.0".into());
+    let dead_rx = session.dead_signal();
     Ok(PcSession {
         session: tokio::sync::Mutex::new(session),
         input: std::sync::Mutex::new(None),
         verify_rx: std::sync::Mutex::new(None),
         verify_stop: std::sync::atomic::AtomicBool::new(false),
+        dead_rx: tokio::sync::Mutex::new(dead_rx),
+        watch_stop: std::sync::atomic::AtomicBool::new(false),
         token,
         data_ip: phone_ip.clone(),
         pc_ip,
