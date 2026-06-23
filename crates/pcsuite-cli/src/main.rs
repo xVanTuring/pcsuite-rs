@@ -361,6 +361,8 @@ async fn cmd_clipboard(args: Args) -> Result<()> {
         connect_type: t.connect_type.clone(),
         vdfs_fetch_host: t.vdfs_fetch_host.clone(),
         vdfs_fetch_port: t.vdfs_fetch_port,
+        recv_from_phone: true,
+        send_to_phone: true,
     };
     let backend: Arc<dyn ClipboardBackend> = Arc::new(MacClipboard);
 
@@ -632,6 +634,8 @@ async fn cmd_all(args: Args) -> Result<()> {
             connect_type: t.connect_type.clone(),
             vdfs_fetch_host: t.vdfs_fetch_host.clone(),
             vdfs_fetch_port: t.vdfs_fetch_port,
+            recv_from_phone: true,
+            send_to_phone: true,
         };
         session.enable_clipboard(cfg, Arc::new(MacClipboard)).await?;
     }

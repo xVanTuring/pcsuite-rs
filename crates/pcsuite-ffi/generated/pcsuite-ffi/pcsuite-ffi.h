@@ -26,13 +26,16 @@ uintptr_t __swift_bridge__$Vec_PcSession$len(void* vec_ptr);
 void* __swift_bridge__$Vec_PcSession$as_ptr(void* vec_ptr);
 
 void* __swift_bridge__$PcScreen$next_frame(void* self);
-struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$start_screen(void* self);
-void* __swift_bridge__$PcSession$enable_clipboard(void* self);
+void __swift_bridge__$PcScreen$stop(void* self);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$start_screen(void* self, int64_t max_size);
+void* __swift_bridge__$PcSession$enable_clipboard(void* self, bool recv, bool send);
 void __swift_bridge__$PcSession$enable_verify(void* self);
 void* __swift_bridge__$PcSession$next_verify_code(void* self);
+void __swift_bridge__$PcSession$stop_verify(void* self);
 bool __swift_bridge__$PcSession$mouse(void* self, uint8_t action, uint8_t button, int64_t x, int64_t y, int64_t w, int64_t h);
 bool __swift_bridge__$PcSession$scroll(void* self, int64_t vscroll, int64_t x, int64_t y, int64_t w, int64_t h);
 bool __swift_bridge__$PcSession$tap(void* self, int64_t x, int64_t y, int64_t w, int64_t h);
+bool __swift_bridge__$PcSession$key(void* self, int64_t keycode);
 void __swift_bridge__$pcsuite_log_init(void);
 uint32_t __swift_bridge__$pcsuite_abi_version(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_usb(void);

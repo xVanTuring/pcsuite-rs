@@ -177,6 +177,7 @@ impl Session {
             pc_iv.clone(),
             cfg.vdfs_fetch_host.clone(),
             cfg.vdfs_fetch_port,
+            cfg.recv_from_phone,
         );
         let listener = TcpListener::bind(format!("{}:8904", cfg.bind_addr))
             .await
@@ -185,13 +186,19 @@ impl Session {
         self.tasks
             .push(clipboard::spawn_8904_server(listener, shared.clone(), backend.clone()));
 
-        // 5679 vdfs server (phone fetches PC images here; PC→phone paste)
-        match clipboard::start_vdfs_server(&cfg.bind_addr, &pc_key, &pc_iv).await {
-            Ok(task) => self.tasks.push(task),
-            Err(e) => tracing::warn!(err = %e, "vdfs 5679 server unavailable (PC→phone images off)"),
+        // 5679 vdfs server (phone fetches PC images here; PC→phone paste) — only
+        // needed when we push to the phone.
+        if cfg.send_to_phone {
+            match clipboard::start_vdfs_server(&cfg.bind_addr, &pc_key, &pc_iv).await {
+                Ok(task) => self.tasks.push(task),
+                Err(e) => tracing::warn!(err = %e, "vdfs 5679 server unavailable (PC→phone images off)"),
+            }
         }
-        self.tasks
-            .push(clipboard::spawn_watcher(shared.clone(), backend, cfg.device_name.clone()));
+        // OS-clipboard watcher (PC→phone) — only when that direction is enabled.
+        if cfg.send_to_phone {
+            self.tasks
+                .push(clipboard::spawn_watcher(shared.clone(), backend, cfg.device_name.clone()));
+        }
 
         let pcinfo = PcInfo {
             ip: &cfg.pc_ip,

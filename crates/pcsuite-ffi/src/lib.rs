@@ -40,23 +40,37 @@ use clipboard_mac::MacClipboard;
 mod ffi {
     extern "Rust" {
         type PcScreen;
-        // Block until the next raw HEVC frame; empty Vec = stream ended. Loop this
-        // on a background thread.
+        // Block until the next raw HEVC frame; empty Vec = stream ended OR stop()
+        // was called. Loop this on a background thread.
         fn next_frame(&self) -> Vec<u8>;
+        // Ask the frame pump to stop: the next (or in-flight) next_frame() returns
+        // an empty Vec within ~300ms so the polling thread can break and release
+        // this PcScreen. Lets Swift tear mirroring down without dropping the handle
+        // out from under a parked next_frame() call.
+        fn stop(&self);
     }
 
     extern "Rust" {
         type PcSession;
 
         // Start screen mirroring; returns a PcScreen to poll. Also arms input.
-        // Drop the PcScreen to stop mirroring.
-        fn start_screen(&self) -> Result<PcScreen, String>;
-        // Enable bidirectional clipboard sync (text + images), built-in macOS backend.
-        fn enable_clipboard(&self) -> Result<(), String>;
+        // `max_size` caps the longer screen edge (px): lower = lower resolution =
+        // less encode/decode latency. Pass 0 for the full-resolution default.
+        // Drop the PcScreen (or call stop()) to stop mirroring.
+        fn start_screen(&self, max_size: i64) -> Result<PcScreen, String>;
+        // Enable clipboard sync (text + images), built-in macOS backend. Direction:
+        // recv = apply the phone's clipboard to this Mac (phone→PC); send = push this
+        // Mac's clipboard to the phone (PC→phone). Pass both true for bidirectional.
+        fn enable_clipboard(&self, recv: bool, send: bool) -> Result<(), String>;
         // Arm SMS verify-code relay; then poll next_verify_code().
         fn enable_verify(&self);
-        // Block for the next SMS code as "code\tsign"; empty = session ended.
+        // Block for the next SMS code as "code\tsign"; empty = session ended OR
+        // stop_verify() was called.
         fn next_verify_code(&self) -> String;
+        // Ask the verify poller to stop: the next (or in-flight) next_verify_code()
+        // returns an empty String within ~300ms so its thread can break and release
+        // this PcSession (mirror of PcScreen::stop for the verify-code loop).
+        fn stop_verify(&self);
 
         // Inject a mouse event. action: 0=down,1=up,2=move. button: 1=left,2=right.
         // Coordinates are in your reference frame (w, h); the phone scales.
@@ -65,6 +79,9 @@ mod ffi {
         fn scroll(&self, vscroll: i64, x: i64, y: i64, w: i64, h: i64) -> bool;
         // Tap (down+up, left button) at (x, y) in the reference frame (w, h).
         fn tap(&self, x: i64, y: i64, w: i64, h: i64) -> bool;
+        // Press an Android key (down+up). keycode is a KEYCODE_* value, e.g.
+        // BACK=4, HOME=3, APP_SWITCH=187. Drives the on-screen navigation keys.
+        fn key(&self, keycode: i64) -> bool;
     }
 
     extern "Rust" {
@@ -108,6 +125,8 @@ pub struct PcSession {
     session: tokio::sync::Mutex<Session>,
     input: std::sync::Mutex<Option<InputHandle>>,
     verify_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    // Set by stop_verify(); the verify poller checks it between short recv timeouts.
+    verify_stop: std::sync::atomic::AtomicBool,
     token: String,
     data_ip: String,
     pc_ip: String,
@@ -121,31 +140,60 @@ pub struct PcSession {
     _reg: Option<Registration>,
 }
 
-/// A live screen-mirror stream. Poll [`PcScreen::next_frame`]; drop to stop.
+/// A live screen-mirror stream. Poll [`PcScreen::next_frame`]; call [`PcScreen::stop`]
+/// (or drop it) to stop.
 pub struct PcScreen {
     frames: tokio::sync::Mutex<ScreenStream>,
+    // Set by stop(); next_frame() observes it between short recv timeouts and
+    // returns an empty Vec so the polling thread breaks and drops this PcScreen.
+    stop: std::sync::atomic::AtomicBool,
 }
 
 impl PcScreen {
     fn next_frame(&self) -> Vec<u8> {
-        rt().block_on(async { self.frames.lock().await.next_frame().await })
-            .unwrap_or_default()
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        rt().block_on(async {
+            let mut frames = self.frames.lock().await;
+            loop {
+                if self.stop.load(Ordering::Relaxed) {
+                    return Vec::new();
+                }
+                // Short timeout so a stop() (or natural end) is noticed promptly even
+                // when the phone screen is static and no frames are arriving.
+                match tokio::time::timeout(Duration::from_millis(300), frames.next_frame()).await {
+                    Ok(opt) => return opt.unwrap_or_default(),
+                    Err(_) => continue,
+                }
+            }
+        })
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 impl PcSession {
-    fn start_screen(&self) -> Result<PcScreen, String> {
+    fn start_screen(&self, max_size: i64) -> Result<PcScreen, String> {
+        let mut params = ScreenParams::default();
+        if max_size > 0 {
+            params.max_size = max_size;
+        }
         let stream = rt()
             .block_on(async {
                 let mut s = self.session.lock().await;
-                s.enable_screen(ScreenParams::default()).await
+                s.enable_screen(params).await
             })
             .map_err(|e| format!("{e:#}"))?;
         *self.input.lock().unwrap() = stream.input();
-        Ok(PcScreen { frames: tokio::sync::Mutex::new(stream) })
+        Ok(PcScreen {
+            frames: tokio::sync::Mutex::new(stream),
+            stop: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
-    fn enable_clipboard(&self) -> Result<(), String> {
+    fn enable_clipboard(&self, recv: bool, send: bool) -> Result<(), String> {
         if let Some(adb) = self.usb_adb.clone() {
             // USB: the phone reaches our relay/vdfs over adb reverse, and we reach
             // the phone's vdfs over adb forward.
@@ -165,6 +213,8 @@ impl PcSession {
             connect_type: self.connect_type.clone(),
             vdfs_fetch_host: self.vdfs_fetch_host.clone(),
             vdfs_fetch_port: self.vdfs_fetch_port,
+            recv_from_phone: recv,
+            send_to_phone: send,
         };
         rt().block_on(async {
             let mut s = self.session.lock().await;
@@ -174,6 +224,7 @@ impl PcSession {
     }
 
     fn enable_verify(&self) {
+        self.verify_stop.store(false, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         *self.verify_rx.lock().unwrap() = Some(rx);
         rt().block_on(async {
@@ -185,13 +236,30 @@ impl PcSession {
     }
 
     fn next_verify_code(&self) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
         // Take the receiver out so we don't hold the std lock across the blocking
         // recv, then put it back.
         let rx = self.verify_rx.lock().unwrap().take();
         let Some(mut rx) = rx else { return String::new() };
-        let code = rt().block_on(rx.recv()).unwrap_or_default();
+        let code = rt().block_on(async {
+            loop {
+                if self.verify_stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                // Short timeout so stop_verify() (or session end) is noticed promptly.
+                match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+                    Ok(v) => return v, // Some(code) or None (channel closed)
+                    Err(_) => continue,
+                }
+            }
+        });
         *self.verify_rx.lock().unwrap() = Some(rx);
-        code
+        code.unwrap_or_default()
+    }
+
+    fn stop_verify(&self) {
+        self.verify_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn mouse(&self, action: u8, button: u8, x: i64, y: i64, w: i64, h: i64) -> bool {
@@ -222,6 +290,13 @@ impl PcSession {
             return false;
         };
         rt().block_on(input.tap(x, y, w, h)).is_ok()
+    }
+
+    fn key(&self, keycode: i64) -> bool {
+        let Some(input) = self.input.lock().unwrap().clone() else {
+            return false;
+        };
+        rt().block_on(input.key(keycode)).is_ok()
     }
 }
 
@@ -269,6 +344,7 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
         session: tokio::sync::Mutex::new(session),
         input: std::sync::Mutex::new(None),
         verify_rx: std::sync::Mutex::new(None),
+        verify_stop: std::sync::atomic::AtomicBool::new(false),
         token: u.token,
         data_ip: "127.0.0.1".into(),
         pc_ip: "127.0.0.1".into(),
@@ -312,6 +388,7 @@ fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, Stri
         session: tokio::sync::Mutex::new(session),
         input: std::sync::Mutex::new(None),
         verify_rx: std::sync::Mutex::new(None),
+        verify_stop: std::sync::atomic::AtomicBool::new(false),
         token,
         data_ip: phone_ip.clone(),
         pc_ip,

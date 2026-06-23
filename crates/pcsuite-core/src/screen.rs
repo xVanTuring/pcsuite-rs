@@ -18,7 +18,7 @@ use tokio::time::{timeout, Instant};
 
 use pcsuite_net::tcp;
 use pcsuite_net::ws::{WsClient, WsFrame};
-use pcsuite_proto::input::{self, MouseAction, MouseButton};
+use pcsuite_proto::input::{self, KeyAction, MouseAction, MouseButton};
 use pcsuite_proto::screen::{self, ScreenParams};
 
 use crate::config;
@@ -59,6 +59,18 @@ impl InputHandle {
     pub async fn tap(&self, x: i64, y: i64, w: i64, h: i64) -> Result<()> {
         self.mouse(MouseAction::Down, MouseButton::Left, x, y, w, h).await?;
         self.mouse(MouseAction::Up, MouseButton::Left, x, y, w, h).await
+    }
+
+    /// Send a single key transition (down or up) for an Android `KEYCODE_*` value.
+    pub async fn key_action(&self, action: KeyAction, keycode: i64) -> Result<()> {
+        self.send(input::keycode_event(action, keycode, 0, 0)).await
+    }
+
+    /// A convenience key press: down then up for `keycode` (e.g. BACK=4, HOME=3,
+    /// APP_SWITCH=187). Used to drive the Android navigation keys.
+    pub async fn key(&self, keycode: i64) -> Result<()> {
+        self.key_action(KeyAction::Down, keycode).await?;
+        self.key_action(KeyAction::Up, keycode).await
     }
 
     /// Send a pre-built `/mirror/control` text message (escape hatch).

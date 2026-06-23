@@ -78,6 +78,10 @@ pub struct ClipboardConfig {
     pub vdfs_fetch_host: String,
     /// Port for the above. USB: `10382` (forward→phone 5678). LAN: `5678`.
     pub vdfs_fetch_port: u16,
+    /// Direction: apply the phone's clipboard to this machine (phone→PC).
+    pub recv_from_phone: bool,
+    /// Direction: push this machine's clipboard to the phone (PC→phone).
+    pub send_to_phone: bool,
 }
 
 pub(crate) struct Shared {
@@ -98,6 +102,9 @@ pub(crate) struct Shared {
     /// Signature of the clipboard image we last handled in *either* direction
     /// (suppress bouncing a just-received image back to the phone).
     last_image_sig: Option<String>,
+    /// When false, incoming phone clipboard frames are read but NOT written to the
+    /// OS clipboard (used to make the relay PC→phone only).
+    apply_incoming: bool,
 }
 
 impl Shared {
@@ -171,7 +178,13 @@ fn extract_json_str(s: &str, key: &str) -> Option<String> {
 pub async fn run_clipboard(cfg: ClipboardConfig, backend: Arc<dyn ClipboardBackend>) -> Result<()> {
     let pc_key = rand_chars(32);
     let pc_iv = rand_chars(16);
-    let shared = new_shared(pc_key.clone(), pc_iv.clone(), cfg.vdfs_fetch_host.clone(), cfg.vdfs_fetch_port);
+    let shared = new_shared(
+        pc_key.clone(),
+        pc_iv.clone(),
+        cfg.vdfs_fetch_host.clone(),
+        cfg.vdfs_fetch_port,
+        cfg.recv_from_phone,
+    );
 
     // 8904 relay server (phone reverse-connects here)
     let listener = TcpListener::bind(format!("{}:8904", cfg.bind_addr))
@@ -180,8 +193,10 @@ pub async fn run_clipboard(cfg: ClipboardConfig, backend: Arc<dyn ClipboardBacke
     tracing::info!(bind = %cfg.bind_addr, "8904 relay listening");
 
     // 5679 vdfs server (phone fetches PC images here; PC→phone paste)
-    if let Err(e) = start_vdfs_server(&cfg.bind_addr, &pc_key, &pc_iv).await {
-        tracing::warn!(err = %e, "vdfs 5679 server unavailable (PC→phone images off)");
+    if cfg.send_to_phone {
+        if let Err(e) = start_vdfs_server(&cfg.bind_addr, &pc_key, &pc_iv).await {
+            tracing::warn!(err = %e, "vdfs 5679 server unavailable (PC→phone images off)");
+        }
     }
     {
         let shared = shared.clone();
@@ -205,7 +220,7 @@ pub async fn run_clipboard(cfg: ClipboardConfig, backend: Arc<dyn ClipboardBacke
     }
 
     // Mac/PC -> phone clipboard watcher
-    {
+    if cfg.send_to_phone {
         let shared = shared.clone();
         let backend = backend.clone();
         let device_name = cfg.device_name.clone();
@@ -435,7 +450,10 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
             if let Some(clip_text) = clip::clip_text_from_json(&text) {
                 let write = {
                     let mut sh = shared.lock().await;
-                    if sh.last_text.as_deref() == Some(clip_text.as_str()) || sh.recently_synced(&clip_text) {
+                    if !sh.apply_incoming
+                        || sh.last_text.as_deref() == Some(clip_text.as_str())
+                        || sh.recently_synced(&clip_text)
+                    {
                         false
                     } else {
                         sh.last_text = Some(clip_text.clone());
@@ -454,7 +472,7 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
                 // vdfs and drop them on the OS clipboard. Done off the 8904 read loop.
                 let proceed = {
                     let mut sh = shared.lock().await;
-                    if sh.last_image_ref.as_deref() == Some(img.path.as_str()) {
+                    if !sh.apply_incoming || sh.last_image_ref.as_deref() == Some(img.path.as_str()) {
                         false
                     } else {
                         sh.last_image_ref = Some(img.path.clone());
@@ -714,7 +732,13 @@ pub(crate) fn rand_clip_keys() -> (String, String) {
 
 /// Build the shared relay state. `fetch_host`/`fetch_port` locate the phone's vdfs
 /// server for image fetch (phone→PC).
-pub(crate) fn new_shared(pc_key: String, pc_iv: String, fetch_host: String, fetch_port: u16) -> SharedRef {
+pub(crate) fn new_shared(
+    pc_key: String,
+    pc_iv: String,
+    fetch_host: String,
+    fetch_port: u16,
+    apply_incoming: bool,
+) -> SharedRef {
     Arc::new(Mutex::new(Shared {
         pc_key,
         pc_iv,
@@ -728,6 +752,7 @@ pub(crate) fn new_shared(pc_key: String, pc_iv: String, fetch_host: String, fetc
         fetch_port,
         last_image_ref: None,
         last_image_sig: None,
+        apply_incoming,
     }))
 }
 

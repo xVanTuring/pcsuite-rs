@@ -40,6 +40,10 @@ extension PcScreenRef {
     public func next_frame() -> RustVec<UInt8> {
         RustVec(ptr: __swift_bridge__$PcScreen$next_frame(ptr))
     }
+
+    public func stop() {
+        __swift_bridge__$PcScreen$stop(ptr)
+    }
 }
 extension PcScreen: Vectorizable {
     public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
@@ -117,12 +121,12 @@ public class PcSessionRef {
     }
 }
 extension PcSessionRef {
-    public func start_screen() throws -> PcScreen {
-        try { let val = __swift_bridge__$PcSession$start_screen(ptr); if val.is_ok { return PcScreen(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    public func start_screen(_ max_size: Int64) throws -> PcScreen {
+        try { let val = __swift_bridge__$PcSession$start_screen(ptr, max_size); if val.is_ok { return PcScreen(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
     }
 
-    public func enable_clipboard() throws -> () {
-        try { let val = __swift_bridge__$PcSession$enable_clipboard(ptr); if val != nil { throw RustString(ptr: val!) } else { return } }()
+    public func enable_clipboard(_ recv: Bool, _ send: Bool) throws -> () {
+        try { let val = __swift_bridge__$PcSession$enable_clipboard(ptr, recv, send); if val != nil { throw RustString(ptr: val!) } else { return } }()
     }
 
     public func enable_verify() {
@@ -131,6 +135,10 @@ extension PcSessionRef {
 
     public func next_verify_code() -> RustString {
         RustString(ptr: __swift_bridge__$PcSession$next_verify_code(ptr))
+    }
+
+    public func stop_verify() {
+        __swift_bridge__$PcSession$stop_verify(ptr)
     }
 
     public func mouse(_ action: UInt8, _ button: UInt8, _ x: Int64, _ y: Int64, _ w: Int64, _ h: Int64) -> Bool {
@@ -143,6 +151,10 @@ extension PcSessionRef {
 
     public func tap(_ x: Int64, _ y: Int64, _ w: Int64, _ h: Int64) -> Bool {
         __swift_bridge__$PcSession$tap(ptr, x, y, w, h)
+    }
+
+    public func key(_ keycode: Int64) -> Bool {
+        __swift_bridge__$PcSession$key(ptr, keycode)
     }
 }
 extension PcSession: Vectorizable {

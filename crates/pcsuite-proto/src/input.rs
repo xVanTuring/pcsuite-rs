@@ -21,6 +21,13 @@ pub enum MouseButton {
     Right = 2,
 }
 
+/// Android `KeyEvent` action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    Down = 0,
+    Up = 1,
+}
+
 /// Build a `MOUSE_EVENT:{…}` text message.
 ///
 /// NB: the JSON key is `"position"` (gson `@SerializedName`) — the Java field is
@@ -50,6 +57,21 @@ pub fn scroll_event(vscroll: i64, x: i64, y: i64, w: i64, h: i64) -> String {
     )
 }
 
+/// Build a `KEYCODE_EVENT:{…}` text message — injects an Android `KeyEvent`.
+/// `keycode` is an Android `KEYCODE_*` value (e.g. BACK=4, HOME=3, APP_SWITCH=187);
+/// `metastate`/`scancode` are 0 for an ordinary press.
+pub fn keycode_event(action: KeyAction, keycode: i64, metastate: i64, scancode: i64) -> String {
+    format!(
+        "KEYCODE_EVENT:{}",
+        json!({
+            "action": action as i64,
+            "keycode": keycode,
+            "metastate": metastate,
+            "scancode": scancode,
+        })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +96,17 @@ mod tests {
         assert_eq!(v["vscroll"], -1);
         assert_eq!(v["wheel_radio"], 1.0);
         assert_eq!(v["hscroll"], 0);
+    }
+
+    #[test]
+    fn keycode_event_shape() {
+        let k = keycode_event(KeyAction::Down, 4, 0, 0);
+        assert!(k.starts_with("KEYCODE_EVENT:"));
+        let v: serde_json::Value = serde_json::from_str(&k["KEYCODE_EVENT:".len()..]).unwrap();
+        assert_eq!(v["action"], 0);
+        assert_eq!(v["keycode"], 4);
+        assert_eq!(v["metastate"], 0);
+        assert_eq!(v["scancode"], 0);
+        assert_eq!(keycode_event(KeyAction::Up, 187, 0, 0).matches("\"action\":1").count(), 1);
     }
 }
