@@ -149,6 +149,22 @@ extension PcSessionRef {
         __swift_bridge__$PcSession$stop_verify(ptr)
     }
 
+    public func enable_notify() {
+        __swift_bridge__$PcSession$enable_notify(ptr)
+    }
+
+    public func next_notification() -> RustString {
+        RustString(ptr: __swift_bridge__$PcSession$next_notification(ptr))
+    }
+
+    public func stop_notify() {
+        __swift_bridge__$PcSession$stop_notify(ptr)
+    }
+
+    public func device_info() throws -> RustString {
+        try { let val = __swift_bridge__$PcSession$device_info(ptr); if val.is_ok { return RustString(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
     public func wait_disconnect() -> RustString {
         RustString(ptr: __swift_bridge__$PcSession$wait_disconnect(ptr))
     }

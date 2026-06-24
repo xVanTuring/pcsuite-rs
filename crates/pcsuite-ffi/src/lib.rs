@@ -83,6 +83,22 @@ mod ffi {
         // this PcSession (mirror of PcScreen::stop for the verify-code loop).
         fn stop_verify(&self);
 
+        // Arm phone notification relay; then poll next_notification().
+        fn enable_notify(&self);
+        // Block for the next phone notification, tab-separated as
+        // "appName\ttitle\tcontent\tpackageName\tpendingIntentId"; empty = session
+        // ended OR stop_notify() was called.
+        fn next_notification(&self) -> String;
+        // Ask the notify poller to stop (mirror of stop_verify for notifications).
+        fn stop_notify(&self);
+
+        // Fetch phone device facts (storage capacity, model, OS) via the 10380
+        // /base-info gateway. Returns tab-separated fields, in order:
+        //   name, brand, product, androidVersion, osVersion, widthPx, heightPx,
+        //   fold(0/1), totalStorageGb, availableStorageGb, availableBytes, account
+        // Blocking (one HTTP round-trip) — call off the main thread.
+        fn device_info(&self) -> Result<String, String>;
+
         // Block until the connection is lost (the shared 10380 control WS — used by
         // both USB and LAN — closed or errored), returning a short reason string.
         // Returns "" if stop_watch() was called first (intentional teardown). Loop
@@ -155,6 +171,12 @@ pub struct PcSession {
     verify_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
     // Set by stop_verify(); the verify poller checks it between short recv timeouts.
     verify_stop: std::sync::atomic::AtomicBool,
+    // Notification relay — mirror of the verify channel/stop pair.
+    notify_rx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    notify_stop: std::sync::atomic::AtomicBool,
+    // Cached phone mobileDeviceId for /base-info; resolved lazily without re-sending
+    // a SHADOW startup when one is already on the wire (see resolve_device_id).
+    device_id_cache: std::sync::Mutex<String>,
     // Liveness of the shared control WS; reads `true` once the connection is lost.
     dead_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
     // Set by stop_watch(); the disconnect watcher checks it between short timeouts.
@@ -339,6 +361,93 @@ impl PcSession {
         self.verify_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    fn enable_notify(&self) {
+        self.notify_stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        *self.notify_rx.lock().unwrap() = Some(rx);
+        rt().block_on(async {
+            let mut s = self.session.lock().await;
+            s.enable_notify(move |n| {
+                let _ = tx.send(format!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    n.app_name, n.title, n.content, n.package_name, n.pending_intent_id
+                ));
+            });
+        });
+    }
+
+    fn next_notification(&self) -> String {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+        let rx = self.notify_rx.lock().unwrap().take();
+        let Some(mut rx) = rx else { return String::new() };
+        let msg = rt().block_on(async {
+            loop {
+                if self.notify_stop.load(Ordering::Relaxed) {
+                    return None;
+                }
+                match tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
+                    Ok(v) => return v, // Some(line) or None (channel closed)
+                    Err(_) => continue,
+                }
+            }
+        });
+        *self.notify_rx.lock().unwrap() = Some(rx);
+        msg.unwrap_or_default()
+    }
+
+    fn stop_notify(&self) {
+        self.notify_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn device_info(&self) -> Result<String, String> {
+        let device_id = self.resolve_device_id()?;
+        let info = rt()
+            .block_on(pcsuite_core::device::fetch(&self.data_ip, &self.token, &device_id))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            info.mobile_device_name,
+            info.mobile_brand,
+            info.product,
+            info.android_version,
+            info.os_version,
+            info.width_pixels,
+            info.height_pixels,
+            info.fold_screen as i32,
+            info.total_storage_gb,
+            info.available_storage_gb,
+            info.available_bytes,
+            info.vivo_account,
+        ))
+    }
+
+    /// Resolve (and cache) the phone's `mobileDeviceId` for `/base-info`. Prefers a
+    /// SHADOW reply already on the wire (reading it sends nothing, so it can't disturb
+    /// an active clipboard session); only asks — a harmless `startup`, no `ready` — if
+    /// nothing has announced yet.
+    fn resolve_device_id(&self) -> Result<String, String> {
+        {
+            let c = self.device_id_cache.lock().unwrap();
+            if !c.is_empty() {
+                return Ok(c.clone());
+            }
+        }
+        let id = rt()
+            .block_on(async {
+                let s = self.session.lock().await;
+                if let Some(id) = s.known_device_id() {
+                    return Ok::<String, anyhow::Error>(id);
+                }
+                let identity = config::default_identity();
+                let p = s.phone_info(&self.pc_ip, &self.connect_type, &identity).await?;
+                Ok(p.mobile_device_id)
+            })
+            .map_err(|e| format!("{e:#}"))?;
+        *self.device_id_cache.lock().unwrap() = id.clone();
+        Ok(id)
+    }
+
     fn wait_disconnect(&self) -> String {
         use std::sync::atomic::Ordering;
         use std::time::Duration;
@@ -470,6 +579,9 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
         input: std::sync::Mutex::new(None),
         verify_rx: std::sync::Mutex::new(None),
         verify_stop: std::sync::atomic::AtomicBool::new(false),
+        notify_rx: std::sync::Mutex::new(None),
+        notify_stop: std::sync::atomic::AtomicBool::new(false),
+        device_id_cache: std::sync::Mutex::new(String::new()),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
         token: u.token,
@@ -517,6 +629,9 @@ fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, Stri
         input: std::sync::Mutex::new(None),
         verify_rx: std::sync::Mutex::new(None),
         verify_stop: std::sync::atomic::AtomicBool::new(false),
+        notify_rx: std::sync::Mutex::new(None),
+        notify_stop: std::sync::atomic::AtomicBool::new(false),
+        device_id_cache: std::sync::Mutex::new(String::new()),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
         token,

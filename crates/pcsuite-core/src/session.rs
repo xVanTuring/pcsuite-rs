@@ -108,6 +108,20 @@ impl Session {
         self.control.clone()
     }
 
+    /// The phone's `mobileDeviceId` if it has already been learned from a retained
+    /// SHADOW reply (e.g. a running clipboard handshake or an earlier `phone_info`),
+    /// without sending anything on the wire. Lets a feature that needs the device id
+    /// (e.g. the `/base-info` device query) reuse it instead of re-announcing a
+    /// `startup` — which would rotate the clipboard keys mid-session.
+    pub fn known_device_id(&self) -> Option<String> {
+        self.control
+            .last_shadow()
+            .as_deref()
+            .and_then(clip::parse_shadow_reply)
+            .map(|s| s.mobile_device_id)
+            .filter(|id| !id.is_empty())
+    }
+
     /// A receiver for the session-death signal: it reads `true` once the control
     /// WS owner task has exited (connection lost). The app polls this to drive
     /// reconnection. Cloned so each consumer awaits independently.
