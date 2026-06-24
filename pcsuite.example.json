@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to pcsuite.json (git-ignored) or $HOME/.config/pcsuite/config.json, then fill in your own pairing identity. Every field can also be set via env (PCSUITE_OPEN_ID, PCSUITE_PC_MAC, PCSUITE_ACCOUNT, PCSUITE_DEVICE_NAME, PCSUITE_SEED), which overrides the file.",
+
+  "open_id": "your-account-openid",
+  "pc_mac": "001122334455",
+  "account": "138****000",
+  "device_name": "My MacBook Pro",
+
+  "seed": "optional-default-pairing-seed-uuid-for-any-ip",
+  "seeds": {
+    "192.168.1.42": "per-ip-pairing-seed-uuid-from-the-phone"
+  }
+}

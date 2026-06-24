@@ -246,43 +246,35 @@ pub fn gcm12_open_noauth(ciphertext: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec
 mod tests {
     use super::*;
 
-    /// per-IP stored seed for 192.168.1.42 (historyPhone.json ext.seeds).
+    // Synthetic, non-personal test fixtures. The real on-device conformance
+    // vectors (captured from the official desktop service) are personal data —
+    // they decrypt to a real account openId/token — so they are kept only in a
+    // local, untracked fixture and are never committed.
     const STORED: &str = "00000000-0000-4000-8000-000000000000";
-
-    /// 3 real (seed_b, sign) pairs produced by the official desktop service
-    /// (captured to /tmp/vcs.log). Source of truth for byte-exact parity.
-    const SAMPLES: &[(&str, &str)] = &[
-        (
-            "11111111-1111-4111-8111-111111111111",
-            "REDACTED_SIGN_1",
-        ),
-        (
-            "22222222-2222-4222-8222-222222222222",
-            "REDACTED_SIGN_2",
-        ),
-        (
-            "33333333-3333-4333-8333-333333333333",
-            "REDACTED_SIGN_3",
-        ),
-    ];
+    const SEED_B: &str = "11111111-1111-4111-8111-111111111111";
 
     #[test]
-    fn cbc_sign_byte_exact() {
-        for (seed_b, real) in SAMPLES {
-            let pt = decrypt_sign(real, STORED, seed_b).expect("decrypt official sign");
-            let parts: Vec<&str> = pt.split('|').collect();
-            assert_eq!(parts.len(), 3, "plaintext must be openId|connId|token");
-            // re-encrypt the recovered fields; must match the official sign exactly.
-            let mine = make_sign(parts[0], parts[1], parts[2], STORED, seed_b);
-            assert_eq!(&mine, real, "re-encrypt must match official sign byte-for-byte");
-        }
+    fn cbc_sign_roundtrip_and_kat() {
+        // Fixed synthetic identity, so the ciphertext below is a frozen KAT that
+        // locks the CBC key-derivation / IV / padding behaviour against regressions.
+        let sign = make_sign("demoopenid000001", "conn-demo-01", "tok-demo-abc", STORED, SEED_B);
+
+        // decrypt must recover the exact openId|connId|token plaintext.
+        let pt = decrypt_sign(&sign, STORED, SEED_B).expect("decrypt own sign");
+        assert_eq!(pt, "demoopenid000001|conn-demo-01|tok-demo-abc");
+
+        // byte-exact frozen KAT.
+        assert_eq!(
+            sign,
+            "d38850f41520052050c1ca180ae45357f02d654e092af6ad2b9967f768f25a1c59f1fd73ad6e21b32f6f0b25fca19921",
+            "make_sign output must be byte-stable"
+        );
     }
 
     #[test]
     fn connecttype1_key_is_sha256_of_seedb() {
         // remote path: stored_seed = "" -> key = SHA256(seed_b)
-        let seed_b = "11111111-1111-4111-8111-111111111111";
-        assert_eq!(derive_sign_key("", seed_b), sha256(seed_b.as_bytes()));
+        assert_eq!(derive_sign_key("", SEED_B), sha256(SEED_B.as_bytes()));
     }
 
     #[test]

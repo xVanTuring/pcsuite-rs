@@ -11,3 +11,6 @@
 # Local captures / scratch
 *.h265
 *.hevc
+
+# Local runtime config: your pairing identity + seeds (never commit this)
+/pcsuite.json

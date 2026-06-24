@@ -50,11 +50,19 @@ Transports:
 - 🔧 Clipboard — handshake + 8904 relay live; PC→phone working, phone→PC under test.
 - ⏳ Pending — clipboard images (vdfs), verify-code relay, LAN clipboard.
 
-## Note
+## Configuration
 
-`crates/pcsuite-core/src/config.rs` contains this machine's own pairing identity
-(account openId, MAC, device name, per-IP seed). Replace with your own values
-before use, and scrub before publishing anywhere public.
+The pairing identity (account openId, PC MAC, device name) and the per-IP pairing
+seeds are **not** hardcoded — they load at runtime, with this precedence:
+
+1. environment variables — `PCSUITE_OPEN_ID`, `PCSUITE_PC_MAC`, `PCSUITE_ACCOUNT`,
+   `PCSUITE_DEVICE_NAME`, `PCSUITE_SEED`;
+2. a JSON file — `$PCSUITE_CONFIG`, else `./pcsuite.json`, else
+   `$HOME/.config/pcsuite/config.json` (see [`pcsuite.example.json`](pcsuite.example.json));
+3. obviously-fake placeholder defaults that will not pair with a real phone.
+
+Copy `pcsuite.example.json` to `pcsuite.json` (git-ignored) and fill in your own
+values. Get the per-IP seed from the phone's `historyPhone` `ext.seeds`.
 
 ## License
 
