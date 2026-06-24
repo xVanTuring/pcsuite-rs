@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    config, mdfs, register, run_clipboard, run_notify, run_verify, usb, ClipboardBackend,
+    config, device, mdfs, register, run_clipboard, run_notify, run_verify, usb, ClipboardBackend,
     ClipboardConfig, ListKind, NotifyConfig, RegisterConfig, Registration, Screen, ScreenParams,
     Session, UsbConfig, VerifyConfig,
 };
@@ -124,6 +124,7 @@ fn print_help() {
          pcsuite clipboard  (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite verify-code (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite notify (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
+         pcsuite info (--usb | --phone <IP> [--remote])   (device model/OS + storage capacity)\n  \
          pcsuite ls (--usb | --phone <IP> [--remote]) [--type recent|image|video|audio|file|doc|home]\n  \
          pcsuite pull (--usb | --phone <IP> [--remote]) --path <phone-path> [--out <file>]\n  \
          pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify|--notify] \
@@ -154,6 +155,7 @@ async fn main() -> Result<()> {
         "clipboard" => cmd_clipboard(args).await,
         "verify-code" => cmd_verify(args).await,
         "notify" => cmd_notify(args).await,
+        "info" => cmd_info(args).await,
         "ls" => cmd_ls(args).await,
         "pull" => cmd_pull(args).await,
         "all" => cmd_all(args).await,
@@ -573,6 +575,39 @@ fn display_mac_notification(title: &str, subtitle: &str, body: &str) {
         .arg("-e")
         .arg(script)
         .output();
+}
+
+/// Show phone device info (storage capacity, model, OS) via the 10380 `/base-info`
+/// gateway — the desktop app's device-panel data. Opens the control session to learn
+/// the phone's `mobileDeviceId`, then fetches.
+async fn cmd_info(args: Args) -> Result<()> {
+    let identity = config::default_identity();
+    let t = resolve_transport(&args, "info").await?;
+    let session = Session::connect(&t.data_ip, &t.token).await?;
+    let phone = session.phone_info(&t.pc_ip, &t.connect_type, &identity).await?;
+
+    let result = device::fetch(&t.data_ip, &t.token, &phone.mobile_device_id).await;
+    drop(session);
+    cleanup_transport(&t, false).await;
+
+    let info = result?;
+    let brand = if info.mobile_brand.is_empty() { String::new() } else { format!(" ({})", info.mobile_brand) };
+    println!("📱 {}{}", phone.mobile_device_name, brand);
+    if !info.product.is_empty() || !info.android_version.is_empty() {
+        println!("   型号 {}   Android {}   OS {}", info.product, info.android_version, info.os_version);
+    }
+    if info.width_pixels > 0 {
+        let fold = if info.fold_screen { "  折叠屏" } else { "" };
+        println!("   屏幕 {}×{}{}", info.width_pixels, info.height_pixels, fold);
+    }
+    println!(
+        "   存储 {} GB 可用 / {} GB 总  ({} 可用)",
+        info.available_storage_gb, info.total_storage_gb, human_size(info.available_bytes)
+    );
+    if !info.vivo_account.is_empty() {
+        println!("   账号 {}", info.vivo_account);
+    }
+    Ok(())
 }
 
 /// Browse a phone file/media category over the mdfs HTTP API (10380). Opens the

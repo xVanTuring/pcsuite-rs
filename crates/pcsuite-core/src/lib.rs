@@ -13,6 +13,7 @@ pub mod adb;
 pub mod clipboard;
 pub mod config;
 pub mod connect;
+pub mod device;
 pub mod mdfs;
 pub mod notify;
 pub mod screen;
@@ -24,6 +25,7 @@ pub mod wsconn;
 
 pub use clipboard::{run_clipboard, ClipboardBackend, ClipboardConfig};
 pub use connect::{register, RegisterConfig, Registration};
+pub use device::DeviceInfo;
 pub use mdfs::{Entry as FileEntry, ListKind};
 pub use notify::{run_notify, NotifyConfig};
 pub use screen::{InputHandle, Screen};
