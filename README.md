@@ -1,21 +1,23 @@
 # pcsuite-rs
 
-A pure-Rust core for headless **screen mirroring**, **control input**, and
-**clipboard sync** with an Android phone companion suite — reverse-engineered and
-reimplemented from scratch, with no vendor binaries, no OpenSSL, and no Python.
+A pure-Rust core for headless companion-suite features against an Android phone —
+**screen mirroring**, **control input** (mouse / scroll / keyboard), two-way
+**clipboard** (text + images), **SMS verify-code** and **notification** relay,
+**device info**, and **file browse / pull** — reverse-engineered and reimplemented
+from scratch, with no vendor binaries, no OpenSSL, and no Python.
 
-The goal is a portable core (macOS today, Windows/Linux next) that delivers raw
-HEVC frames + clipboard events and accepts control input, leaving decode and UI
-to a platform frontend (FFI / IPC / Flutter — deliberately deferred).
+The core delivers raw HEVC frames + events and accepts input over **USB, LAN, or
+remote**, leaving video decode and UI to a platform frontend. A SwiftUI macOS app
+ships today via `pcsuite-ffi`; Windows/Linux and a Flutter/IPC layer are deferred.
 
 ## Workspace
 
 | crate | role |
 |-------|------|
-| `pcsuite-crypto` | AES-256-CBC "sign" + AES-256-GCM (16-byte nonce) — byte-exact, pure RustCrypto |
+| `pcsuite-crypto` | AES-256-CBC "sign" + AES-256-GCM (12- and 16-byte nonce) — pure RustCrypto |
 | `pcsuite-proto`  | wire formats: 10191 `PAY_LOAD_1`, connect frames, 8904 ruying frame, screen/input/clipboard messages |
 | `pcsuite-net`    | SSDP, TLS (rustls/ring, accepts self-signed), hand-rolled RFC6455 WS client |
-| `pcsuite-core`   | sessions: ConnectFlow registration, screen data plane, control input, clipboard relay, USB (adb) path |
+| `pcsuite-core`   | sessions: ConnectFlow registration, screen data plane, control input, clipboard / image / verify-code / notification relay, device info, file browse, USB (adb) + LAN/remote paths |
 | `pcsuite-cli`    | headless `pcsuite` binary that drives the core |
 | `pcsuite-ffi`    | swift-bridge bindings (static lib + generated Swift) for a SwiftUI macOS app — see `crates/pcsuite-ffi/SWIFT_INTEGRATION.md` |
 
@@ -23,7 +25,7 @@ to a platform frontend (FFI / IPC / Flutter — deliberately deferred).
 
 ```bash
 cargo build
-cargo test          # offline unit tests (crypto byte-exact, frame round-trips, …)
+cargo test          # offline unit tests (crypto KATs, frame round-trips, …)
 ```
 
 ## CLI
