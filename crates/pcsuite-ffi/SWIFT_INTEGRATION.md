@@ -23,6 +23,27 @@ so there are no `Send`/delegate hazards:
 Decoding HEVC and drawing is the app's job (the core ships raw frames) — see
 [§5](#5-decoding--displaying-hevc).
 
+### Pairing identity
+
+`pcsuite_connect_*` read the pairing identity (account openId, PC MAC, device
+name) and the per-IP pairing seed through the core's runtime config — the app does
+not pass them. A Finder-launched `.app` has no shell environment and runs with
+CWD `/`, so the env vars and `./pcsuite.json` don't apply; the app (unsandboxed)
+reads **`~/.config/pcsuite/config.json`**. Create it from
+[`pcsuite.example.json`](../../pcsuite.example.json):
+
+```jsonc
+// ~/.config/pcsuite/config.json
+{
+  "open_id": "…", "pc_mac": "…", "device_name": "My Mac",
+  "seeds": { "192.168.1.42": "…pairing-seed-uuid…" }
+}
+```
+
+With no config the core falls back to obviously-fake placeholders that will not
+pair. (To instead push identity from the app's own settings UI, add `set_*` FFI
+functions and call them before `pcsuite_connect_*` — not wired today.)
+
 ---
 
 ## 1. Build the library
