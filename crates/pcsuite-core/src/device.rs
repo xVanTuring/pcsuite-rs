@@ -44,7 +44,7 @@ pub async fn fetch(host: &str, token: &str, device_id: &str) -> Result<DeviceInf
     // `token` — a non-empty PC token that mismatched the phone's stored remote token
     // makes it bail early, whereas an empty token skips that equality check.
     let body = json!({
-        "pcDeviceId": config::CLIP_PC_ID,
+        "pcDeviceId": config::clip_pc_id(),
         "pcSystemType": "mac",
     });
     let reply = mdfs::post_json(host, token, device_id, "/base-info", &body)

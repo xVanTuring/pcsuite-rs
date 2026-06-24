@@ -139,6 +139,10 @@ mod ffi {
         // Set (empty seed = clear) the stored pairing seed for one phone IP, used by
         // the LAN connectType=2 path. Call before pcsuite_connect_lan.
         fn pcsuite_set_seed(phone_ip: String, seed: String);
+        // Set (empty = default) the super-clipboard PC device id. Must match the id
+        // the phone registered for this PC at pairing, or phone→PC clipboard won't
+        // push. Used by both USB and LAN. Call before connecting.
+        fn pcsuite_set_clip_id(clip_id: String);
         // Connect over USB (adb). Blocks a few seconds — call off the main thread.
         fn pcsuite_connect_usb() -> Result<PcSession, String>;
         // Connect over LAN/Tailscale. remote=true uses connectType=1 (no seed).
@@ -576,6 +580,10 @@ fn pcsuite_set_identity(open_id: String, pc_mac: String, account: String, device
 
 fn pcsuite_set_seed(phone_ip: String, seed: String) {
     config::set_seed(phone_ip, seed);
+}
+
+fn pcsuite_set_clip_id(clip_id: String) {
+    config::set_clip_pc_id(clip_id);
 }
 
 fn pcsuite_connect_usb() -> Result<PcSession, String> {

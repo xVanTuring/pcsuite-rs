@@ -233,9 +233,10 @@ pub async fn run_clipboard(cfg: ClipboardConfig, backend: Arc<dyn ClipboardBacke
         .await
         .context("control WS")?;
     tracing::info!("control WS 101; sending SHADOW_LIKE startup");
+    let pc_id_s = config::clip_pc_id();
     let pcinfo = PcInfo {
         ip: &cfg.pc_ip,
-        pc_device_id: config::CLIP_PC_ID,
+        pc_device_id: &pc_id_s,
         pc_device_name: &cfg.device_name,
         key: &pc_key,
         iv: &pc_iv,
@@ -308,7 +309,8 @@ async fn handle_8904(stream: TcpStream, shared: SharedRef, backend: Arc<dyn Clip
             let sh = shared.lock().await;
             (sh.pc_key.clone(), sh.pc_iv.clone(), sh.phone_id.clone())
         };
-        let pc_id = config::CLIP_PC_ID;
+        let pc_id_owned = config::clip_pc_id();
+        let pc_id = pc_id_owned.as_str();
         let f1 = build_frame(clip::command_announce(pc_id).as_bytes(), &pc_key, &pc_iv, &phone_id, pc_id, 100)?;
         let f2 = build_frame(clip::command_request_clipboard().as_bytes(), &pc_key, &pc_iv, &phone_id, pc_id, 100)?;
         tx.send(f1).await.ok();
@@ -510,7 +512,8 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
                         let sh = shared.lock().await;
                         (sh.pc_key.clone(), sh.pc_iv.clone(), sh.phone_id.clone(), sh.outgoing.clone())
                     };
-                    let pc_id = config::CLIP_PC_ID;
+                    let pc_id_owned = config::clip_pc_id();
+                    let pc_id = pc_id_owned.as_str();
                     // Reversed from vivorelay Database_operations::SyncRequestBean + GetFormatData:
                     // on the phone's type-10005 beacon, the PC replies with a fresh-UUID envelope
                     // of type 1000 carrying the 8-field sync state (full sync = all zero/empty).
@@ -648,9 +651,10 @@ async fn watcher(shared: SharedRef, backend: Arc<dyn ClipboardBackend>, device_n
                 } else {
                     sh.last_text = Some(cur.clone());
                     sh.mark(&cur);
+                    let pc_id = config::clip_pc_id();
                     let json =
-                        clip::clip_text_json(config::CLIP_PC_ID, &device_name, config::CLIP_NICK, &cur, now_ms());
-                    match build_frame(json.as_bytes(), &sh.pc_key, &sh.pc_iv, &sh.phone_id, config::CLIP_PC_ID, 2) {
+                        clip::clip_text_json(&pc_id, &device_name, config::CLIP_NICK, &cur, now_ms());
+                    match build_frame(json.as_bytes(), &sh.pc_key, &sh.pc_iv, &sh.phone_id, &pc_id, 2) {
                         Ok(frame) => sh.outgoing.clone().map(|tx| (tx, frame)),
                         Err(e) => {
                             tracing::warn!(err = %e, "build clipboard frame");
@@ -700,15 +704,16 @@ async fn watcher(shared: SharedRef, backend: Arc<dyn ClipboardBackend>, device_n
         let to_send = {
             let mut sh = shared.lock().await;
             sh.last_image_sig = Some(sig);
+            let pc_id = config::clip_pc_id();
             let json = clip::clip_image_ref_json(
-                config::CLIP_PC_ID,
+                &pc_id,
                 &device_name,
                 config::CLIP_NICK,
                 &backslash,
                 "image/jpeg",
                 now_ms(),
             );
-            match build_frame(json.as_bytes(), &sh.pc_key, &sh.pc_iv, &sh.phone_id, config::CLIP_PC_ID, 2) {
+            match build_frame(json.as_bytes(), &sh.pc_key, &sh.pc_iv, &sh.phone_id, &pc_id, 2) {
                 Ok(frame) => sh.outgoing.clone().map(|tx| (tx, frame)),
                 Err(e) => {
                     tracing::warn!(err = %e, "build image-ref frame");
@@ -763,7 +768,7 @@ pub(crate) async fn start_vdfs_server(bind_addr: &str, pc_key: &str, pc_iv: &str
         .await
         .with_context(|| format!("bind {bind_addr}:5679"))?;
     tracing::info!(bind = %bind_addr, "vdfs 5679 serving (PC→phone images)");
-    Ok(vdfs::spawn_server(listener, pc_key.into(), pc_iv.into(), config::CLIP_PC_ID.into()))
+    Ok(vdfs::spawn_server(listener, pc_key.into(), pc_iv.into(), config::clip_pc_id()))
 }
 
 /// Mime hint from a path's extension (defaults to JPEG).

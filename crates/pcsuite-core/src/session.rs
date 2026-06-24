@@ -142,9 +142,10 @@ impl Session {
     ) -> Result<clip::PhoneSession> {
         let mut rx = self.control.subscribe();
         let (key, iv) = clipboard::rand_clip_keys();
+        let pc_id = config::clip_pc_id();
         let pcinfo = PcInfo {
             ip: pc_ip,
-            pc_device_id: config::CLIP_PC_ID,
+            pc_device_id: &pc_id,
             pc_device_name: &identity.device_name,
             key: &key,
             iv: &iv,
@@ -241,9 +242,10 @@ impl Session {
                 .push(clipboard::spawn_watcher(shared.clone(), backend, cfg.device_name.clone()));
         }
 
+        let pc_id = config::clip_pc_id();
         let pcinfo = PcInfo {
             ip: &cfg.pc_ip,
-            pc_device_id: config::CLIP_PC_ID,
+            pc_device_id: &pc_id,
             pc_device_name: &cfg.device_name,
             key: &pc_key,
             iv: &pc_iv,

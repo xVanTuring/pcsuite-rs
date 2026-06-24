@@ -31,10 +31,11 @@ pub const SERVICE_RECORD: &str = "com.vivo.pcsuite.SERVICE--com.vivo.share.CONNE
 /// The control channel appends `,<token>`; the mirror channel uses it bare.
 pub const SUBPROTOCOL_BASE: &str = "v1.hc.vivo.com.cn";
 
-/// PC device id used for the super-clipboard (6 chars; goes in the ruying frame
-/// `fieldB` and the clipboard JSON `deviceid`). A neutral placeholder — override
-/// the constant if you want a per-machine value.
-pub const CLIP_PC_ID: &str = "pc0000";
+/// Placeholder PC device id (super-clipboard) when nothing is configured. The
+/// phone routes its clipboard *pushes* to the id this PC registered at pairing, so
+/// the value MUST match that for phone→PC sync — set it via `clip_pc_id` in the
+/// config / `PCSUITE_CLIP_PC_ID` / [`set_clip_pc_id`]. See [`clip_pc_id`].
+const CLIP_PC_ID_DEFAULT: &str = "pc0000";
 
 /// Display nickname announced in SHADOW_LIKE / clipboard content.
 pub const CLIP_NICK: &str = "pcsuite";
@@ -48,6 +49,7 @@ struct UserConfig {
     pc_mac: String,
     account: String,
     device_name: String,
+    clip_pc_id: String,
     /// Optional single seed used for any IP without a per-IP entry.
     default_seed: Option<String>,
     /// Per-IP stored pairing seeds (`ip` -> seed UUID).
@@ -83,6 +85,7 @@ fn load() -> &'static UserConfig {
             pc_mac: pick("PCSUITE_PC_MAC", "pc_mac", "000000000000"),
             account: pick("PCSUITE_ACCOUNT", "account", ""),
             device_name: pick("PCSUITE_DEVICE_NAME", "device_name", "pcsuite-pc"),
+            clip_pc_id: pick("PCSUITE_CLIP_PC_ID", "clip_pc_id", CLIP_PC_ID_DEFAULT),
             default_seed,
             seeds,
         }
@@ -131,6 +134,7 @@ struct Overrides {
     pc_mac: Option<String>,
     account: Option<String>,
     device_name: Option<String>,
+    clip_pc_id: Option<String>,
     seeds: HashMap<String, String>,
 }
 
@@ -148,6 +152,22 @@ pub fn set_identity(open_id: String, pc_mac: String, account: String, device_nam
     o.pc_mac = opt(pc_mac);
     o.account = opt(account);
     o.device_name = opt(device_name);
+}
+
+/// Override (empty = clear) the super-clipboard PC device id. Must match the id
+/// the phone registered for this PC at pairing, or phone→PC clipboard won't push.
+pub fn set_clip_pc_id(id: String) {
+    overrides().write().unwrap().clip_pc_id = (!id.is_empty()).then_some(id);
+}
+
+/// The super-clipboard PC device id: runtime override, then env / config file,
+/// then the placeholder. Resolved fresh each call (no caching) so a settings
+/// change followed by a reconnect takes effect without restarting.
+pub fn clip_pc_id() -> String {
+    if let Some(id) = &overrides().read().unwrap().clip_pc_id {
+        return id.clone();
+    }
+    load().clip_pc_id.clone()
 }
 
 /// Override (or, with an empty `seed`, clear) the stored pairing seed for one IP.

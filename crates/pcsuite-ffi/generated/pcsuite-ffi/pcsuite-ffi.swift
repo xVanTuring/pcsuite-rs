@@ -10,6 +10,9 @@ public func pcsuite_set_identity<GenericIntoRustString: IntoRustString>(_ open_i
 public func pcsuite_set_seed<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ seed: GenericIntoRustString) {
     __swift_bridge__$pcsuite_set_seed({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = seed.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
 }
+public func pcsuite_set_clip_id<GenericIntoRustString: IntoRustString>(_ clip_id: GenericIntoRustString) {
+    __swift_bridge__$pcsuite_set_clip_id({ let rustString = clip_id.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+}
 public func pcsuite_connect_usb() throws -> PcSession {
     try { let val = __swift_bridge__$pcsuite_connect_usb(); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
