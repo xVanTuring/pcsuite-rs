@@ -17,7 +17,7 @@
 //! See `pcsuite.example.json` for the file format.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 
 use pcsuite_proto::PcIdentity;
 
@@ -122,25 +122,69 @@ fn read_config_file() -> serde_json::Value {
     serde_json::Value::Null
 }
 
-/// The PC identity used by default, loaded from env / config file / placeholders.
-/// With no configuration present it returns obviously-fake values that will not
-/// pair with a real phone — set real values via env or `pcsuite.json`.
+/// Runtime overrides set by an embedding app (e.g. the SwiftUI settings panel via
+/// FFI). Take precedence over the env/file/placeholder base, so a GUI can supply
+/// the pairing identity without a config file. Empty strings clear a field.
+#[derive(Default)]
+struct Overrides {
+    open_id: Option<String>,
+    pc_mac: Option<String>,
+    account: Option<String>,
+    device_name: Option<String>,
+    seeds: HashMap<String, String>,
+}
+
+fn overrides() -> &'static RwLock<Overrides> {
+    static O: OnceLock<RwLock<Overrides>> = OnceLock::new();
+    O.get_or_init(|| RwLock::new(Overrides::default()))
+}
+
+/// Override the PC identity at runtime. An empty field falls back to the
+/// env/file/placeholder value. Call before connecting.
+pub fn set_identity(open_id: String, pc_mac: String, account: String, device_name: String) {
+    let opt = |s: String| (!s.is_empty()).then_some(s);
+    let mut o = overrides().write().unwrap();
+    o.open_id = opt(open_id);
+    o.pc_mac = opt(pc_mac);
+    o.account = opt(account);
+    o.device_name = opt(device_name);
+}
+
+/// Override (or, with an empty `seed`, clear) the stored pairing seed for one IP.
+pub fn set_seed(ip: String, seed: String) {
+    let mut o = overrides().write().unwrap();
+    if seed.is_empty() {
+        o.seeds.remove(&ip);
+    } else {
+        o.seeds.insert(ip, seed);
+    }
+}
+
+/// The PC identity used by default: runtime overrides win, then env / config file
+/// / placeholders. With nothing configured it returns obviously-fake values that
+/// will not pair with a real phone.
 pub fn default_identity() -> PcIdentity {
     let c = load();
+    let o = overrides().read().unwrap();
+    let pick = |ov: &Option<String>, base: &str| ov.clone().unwrap_or_else(|| base.to_owned());
     PcIdentity {
-        open_id: c.open_id.clone(),
-        pc_mac: c.pc_mac.clone(),
-        account: c.account.clone(),
-        device_name: c.device_name.clone(),
+        open_id: pick(&o.open_id, &c.open_id),
+        pc_mac: pick(&o.pc_mac, &c.pc_mac),
+        account: pick(&o.account, &c.account),
+        device_name: pick(&o.device_name, &c.device_name),
         service_id: SERVICE_ID.into(),
         frame_id: FRAME_ID,
     }
 }
 
 /// Per-IP stored pairing seed (historyPhone `ext.seeds`), used for the LAN
-/// `connectType=2` path. Falls back to the single `PCSUITE_SEED` / `"seed"` value
-/// if no per-IP entry exists. The remote `connectType=1` path needs no seed.
+/// `connectType=2` path. Runtime override wins, then the per-IP config entry, then
+/// the single `PCSUITE_SEED` / `"seed"` value. The remote `connectType=1` path
+/// needs no seed.
 pub fn default_stored_seed(ip: &str) -> Option<String> {
+    if let Some(s) = overrides().read().unwrap().seeds.get(ip) {
+        return Some(s.clone());
+    }
     let c = load();
     c.seeds.get(ip).cloned().or_else(|| c.default_seed.clone())
 }

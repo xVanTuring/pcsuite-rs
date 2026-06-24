@@ -133,6 +133,12 @@ mod ffi {
         fn pcsuite_log_init();
         // ABI version of this library.
         fn pcsuite_abi_version() -> u32;
+        // Set the LAN pairing identity at runtime (empty field = leave default).
+        // Call before pcsuite_connect_lan. USB ignores these.
+        fn pcsuite_set_identity(open_id: String, pc_mac: String, account: String, device_name: String);
+        // Set (empty seed = clear) the stored pairing seed for one phone IP, used by
+        // the LAN connectType=2 path. Call before pcsuite_connect_lan.
+        fn pcsuite_set_seed(phone_ip: String, seed: String);
         // Connect over USB (adb). Blocks a few seconds — call off the main thread.
         fn pcsuite_connect_usb() -> Result<PcSession, String>;
         // Connect over LAN/Tailscale. remote=true uses connectType=1 (no seed).
@@ -562,6 +568,14 @@ fn pcsuite_log_init() {
 
 fn pcsuite_abi_version() -> u32 {
     1
+}
+
+fn pcsuite_set_identity(open_id: String, pc_mac: String, account: String, device_name: String) {
+    config::set_identity(open_id, pc_mac, account, device_name);
+}
+
+fn pcsuite_set_seed(phone_ip: String, seed: String) {
+    config::set_seed(phone_ip, seed);
 }
 
 fn pcsuite_connect_usb() -> Result<PcSession, String> {

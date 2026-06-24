@@ -4,6 +4,12 @@ public func pcsuite_log_init() {
 public func pcsuite_abi_version() -> UInt32 {
     __swift_bridge__$pcsuite_abi_version()
 }
+public func pcsuite_set_identity<GenericIntoRustString: IntoRustString>(_ open_id: GenericIntoRustString, _ pc_mac: GenericIntoRustString, _ account: GenericIntoRustString, _ device_name: GenericIntoRustString) {
+    __swift_bridge__$pcsuite_set_identity({ let rustString = open_id.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = pc_mac.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = account.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = device_name.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+}
+public func pcsuite_set_seed<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ seed: GenericIntoRustString) {
+    __swift_bridge__$pcsuite_set_seed({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), { let rustString = seed.intoRustString(); rustString.isOwned = false; return rustString.ptr }())
+}
 public func pcsuite_connect_usb() throws -> PcSession {
     try { let val = __swift_bridge__$pcsuite_connect_usb(); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }

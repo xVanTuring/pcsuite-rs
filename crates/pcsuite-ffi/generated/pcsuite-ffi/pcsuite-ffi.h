@@ -48,6 +48,8 @@ bool __swift_bridge__$PcSession$tap(void* self, int64_t x, int64_t y, int64_t w,
 bool __swift_bridge__$PcSession$key(void* self, int64_t keycode);
 void __swift_bridge__$pcsuite_log_init(void);
 uint32_t __swift_bridge__$pcsuite_abi_version(void);
+void __swift_bridge__$pcsuite_set_identity(void* open_id, void* pc_mac, void* account, void* device_name);
+void __swift_bridge__$pcsuite_set_seed(void* phone_ip, void* seed);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_usb(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_lan(void* phone_ip, bool remote);
 
