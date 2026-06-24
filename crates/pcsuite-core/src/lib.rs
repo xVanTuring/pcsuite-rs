@@ -14,6 +14,7 @@ pub mod clipboard;
 pub mod config;
 pub mod connect;
 pub mod mdfs;
+pub mod notify;
 pub mod screen;
 pub mod session;
 pub mod usb;
@@ -24,6 +25,7 @@ pub mod wsconn;
 pub use clipboard::{run_clipboard, ClipboardBackend, ClipboardConfig};
 pub use connect::{register, RegisterConfig, Registration};
 pub use mdfs::{Entry as FileEntry, ListKind};
+pub use notify::{run_notify, NotifyConfig};
 pub use screen::{InputHandle, Screen};
 pub use session::{ControlHandle, ScreenStream, Session};
 pub use usb::{UsbConfig, UsbSession};
@@ -31,5 +33,6 @@ pub use verify::{run_verify, VerifyConfig};
 
 // Re-exports so frontends/CLIs depend only on this crate.
 pub use pcsuite_proto::input::{MouseAction, MouseButton};
+pub use pcsuite_proto::notify::Notification;
 pub use pcsuite_proto::screen::ScreenParams;
 pub use pcsuite_proto::PcIdentity;

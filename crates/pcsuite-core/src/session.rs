@@ -181,6 +181,17 @@ impl Session {
             .push(tokio::spawn(crate::verify::verify_feature(control, on_code)));
     }
 
+    /// Enable phone notification relay; `on_notify` fires for each forwarded
+    /// notification.
+    pub fn enable_notify<F>(&mut self, on_notify: F)
+    where
+        F: Fn(&pcsuite_proto::notify::Notification) + Send + 'static,
+    {
+        let control = self.control.clone();
+        self.tasks
+            .push(tokio::spawn(crate::notify::notify_feature(control, on_notify)));
+    }
+
     /// Enable text clipboard sync (8904 relay + SHADOW_LIKE over the shared WS).
     pub async fn enable_clipboard(
         &mut self,

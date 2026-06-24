@@ -23,8 +23,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    config, mdfs, register, run_clipboard, run_verify, usb, ClipboardBackend, ClipboardConfig,
-    ListKind, RegisterConfig, Registration, Screen, ScreenParams, Session, UsbConfig, VerifyConfig,
+    config, mdfs, register, run_clipboard, run_notify, run_verify, usb, ClipboardBackend,
+    ClipboardConfig, ListKind, NotifyConfig, RegisterConfig, Registration, Screen, ScreenParams,
+    Session, UsbConfig, VerifyConfig,
 };
 
 struct Args {
@@ -40,6 +41,7 @@ struct Args {
     feat_screen: bool,
     feat_clipboard: bool,
     feat_verify: bool,
+    feat_notify: bool,
     /// `ls` category: recent|image|video|audio|file|doc|home.
     list_type: Option<String>,
     /// `pull` phone-side absolute path.
@@ -62,6 +64,7 @@ fn parse_args() -> Args {
         feat_screen: false,
         feat_clipboard: false,
         feat_verify: false,
+        feat_notify: false,
         list_type: None,
         path: None,
     };
@@ -75,6 +78,7 @@ fn parse_args() -> Args {
             "--screen" => a.feat_screen = true,
             "--clipboard" => a.feat_clipboard = true,
             "--verify" => a.feat_verify = true,
+            "--notify" => a.feat_notify = true,
             "--phone" => {
                 i += 1;
                 a.phone = raw.get(i).cloned();
@@ -119,11 +123,12 @@ fn print_help() {
          [--seconds <N>] [--out <file.h265>] [--input-test]\n  \
          pcsuite clipboard  (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite verify-code (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
+         pcsuite notify (--usb | --phone <IP> [--remote]) [--seconds <N>]\n  \
          pcsuite ls (--usb | --phone <IP> [--remote]) [--type recent|image|video|audio|file|doc|home]\n  \
          pcsuite pull (--usb | --phone <IP> [--remote]) --path <phone-path> [--out <file>]\n  \
-         pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify] \
+         pcsuite all (--usb | --phone <IP> [--remote]) [--screen|--clipboard|--verify|--notify] \
          [--seconds <N>] [--out <f>]\n\
-         \x20                                       (clipboard+verify in the background; type\n\
+         \x20                                       (clipboard+verify+notify in the background; type\n\
          \x20                                        `screen on`/`screen off` at the prompt to\n\
          \x20                                        toggle mirroring. --screen starts it on.)\n\n\
          Transports: --usb (adb forward/reverse) or --phone <IP> (LAN ConnectFlow;\n\
@@ -148,6 +153,7 @@ async fn main() -> Result<()> {
         "screen" => cmd_screen(args).await,
         "clipboard" => cmd_clipboard(args).await,
         "verify-code" => cmd_verify(args).await,
+        "notify" => cmd_notify(args).await,
         "ls" => cmd_ls(args).await,
         "pull" => cmd_pull(args).await,
         "all" => cmd_all(args).await,
@@ -518,6 +524,57 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+/// Relay phone notifications: each one the phone forwards is printed and shown as a
+/// native macOS notification.
+async fn cmd_notify(args: Args) -> Result<()> {
+    let t = resolve_transport(&args, "notify").await?;
+    let cfg = NotifyConfig {
+        data_ip: t.data_ip.clone(),
+        token: t.token.clone(),
+    };
+    println!("🔔 notification relay running — phone notifications will appear on the Mac. Ctrl-C to stop.");
+    let run = run_notify(cfg, show_phone_notification);
+    let seconds = args.seconds.unwrap_or(0.0);
+    let result = if seconds > 0.0 {
+        match tokio::time::timeout(Duration::from_secs_f64(seconds), run).await {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::info!("notify: time limit reached");
+                Ok(())
+            }
+        }
+    } else {
+        run.await
+    };
+    cleanup_transport(&t, false).await;
+    result
+}
+
+/// Print a forwarded phone notification and surface it as a native macOS banner.
+fn show_phone_notification(n: &pcsuite_core::Notification) {
+    let title = if n.title.is_empty() { &n.app_name } else { &n.title };
+    println!("🔔 [{}] {} — {}", n.app_name, title, n.content);
+    display_mac_notification(title, &n.app_name, &n.content);
+}
+
+/// Post a native macOS notification via `osascript` (best-effort, fire-and-forget).
+fn display_mac_notification(title: &str, subtitle: &str, body: &str) {
+    // Escape backslashes and double-quotes for the AppleScript string literals.
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+    let script = format!(
+        "display notification \"{}\" with title \"{}\" subtitle \"{}\"",
+        esc(body),
+        esc(title),
+        esc(subtitle),
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output();
+}
+
 /// Browse a phone file/media category over the mdfs HTTP API (10380). Opens the
 /// control session (to learn the phone's `mobileDeviceId`), then lists.
 async fn cmd_ls(args: Args) -> Result<()> {
@@ -597,16 +654,22 @@ fn human_size(n: u64) -> String {
 
 /// Unified session: screen + clipboard + verify-code over one control connection.
 async fn cmd_all(args: Args) -> Result<()> {
-    // Background features (clipboard + verify) default on; screen does NOT auto-start
-    // — toggle it at runtime from the prompt (or pass --screen to start it on).
-    let any = args.feat_screen || args.feat_clipboard || args.feat_verify;
-    let (start_screen, do_clip, do_verify) = if any {
-        (args.feat_screen, args.feat_clipboard, args.feat_verify)
+    // Background features (clipboard + verify + notify) default on; screen does NOT
+    // auto-start — toggle it at runtime from the prompt (or pass --screen to start on).
+    let any = args.feat_screen || args.feat_clipboard || args.feat_verify || args.feat_notify;
+    let (start_screen, do_clip, do_verify, do_notify) = if any {
+        (args.feat_screen, args.feat_clipboard, args.feat_verify, args.feat_notify)
     } else {
-        (false, true, true)
+        (false, true, true, true)
     };
     let identity = config::default_identity();
-    tracing::info!(screen = start_screen, clipboard = do_clip, verify = do_verify, "pcsuite all");
+    tracing::info!(
+        screen = start_screen,
+        clipboard = do_clip,
+        verify = do_verify,
+        notify = do_notify,
+        "pcsuite all"
+    );
 
     let t = resolve_transport(&args, "all").await?;
     if do_clip {
@@ -622,6 +685,9 @@ async fn cmd_all(args: Args) -> Result<()> {
             println!("★ SMS code: {code}  (from: {sign})");
             copy_to_clipboard(code);
         });
+    }
+    if do_notify {
+        session.enable_notify(show_phone_notification);
     }
     if do_clip {
         let cfg = ClipboardConfig {
@@ -641,9 +707,10 @@ async fn cmd_all(args: Args) -> Result<()> {
     }
 
     let bg = format!(
-        "{}{}",
+        "{}{}{}",
         if do_clip { "clipboard " } else { "" },
-        if do_verify { "verify-code" } else { "" }
+        if do_verify { "verify-code " } else { "" },
+        if do_notify { "notify" } else { "" }
     );
     let interactive = args.seconds.is_none() && std::io::stdin().is_terminal();
     let result = run_session(&mut session, &args, start_screen, bg.trim(), interactive).await;
@@ -791,5 +858,5 @@ async fn run_session(
 }
 
 fn print_repl_help() {
-    println!("  commands: screen on | screen off | status | help | quit   (clipboard/verify run in the background)");
+    println!("  commands: screen on | screen off | status | help | quit   (clipboard/verify/notify run in the background)");
 }

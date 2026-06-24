@@ -15,6 +15,7 @@
 pub mod clip;
 pub mod connect;
 pub mod input;
+pub mod notify;
 pub mod payload1;
 pub mod ruying;
 pub mod screen;
