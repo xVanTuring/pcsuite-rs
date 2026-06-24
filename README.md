@@ -28,13 +28,19 @@ cargo test          # offline unit tests (crypto byte-exact, frame round-trips, 
 
 ## CLI
 
-```bash
-# Screen mirror (counts frames / dumps raw HEVC):
-pcsuite screen --usb [--seconds N] [--out cap.h265] [--input-test]
-pcsuite screen --phone <IP> [--remote] [--seconds N] [--out cap.h265]
+Every subcommand takes a transport: `--usb`, or `--phone <IP>` (optionally
+`--remote`, `--reg-ip`, `--data-ip`).
 
-# Clipboard text sync (USB):
-pcsuite clipboard --usb [--seconds N]   # --seconds 0 = run until Ctrl-C
+```bash
+pcsuite screen      --usb [--seconds N] [--out cap.h265] [--input-test]
+pcsuite screen      --phone <IP> [--remote] [--seconds N] [--out cap.h265]
+pcsuite clipboard   --phone <IP> [--seconds N]   # text + images, two-way
+pcsuite verify-code --phone <IP>                 # SMS verification-code relay
+pcsuite notify      --phone <IP>                 # phone notifications -> PC
+pcsuite info        --phone <IP>                 # model / OS / storage capacity
+pcsuite ls          --phone <IP> [--type recent|image|video|audio|file|doc|home]
+pcsuite pull        --phone <IP> --path <phone-path> [--out <file>]
+pcsuite all         --phone <IP>                 # clipboard+verify+notify on one connection
 ```
 
 Transports:
@@ -44,11 +50,20 @@ Transports:
 
 ## Status
 
-- ✅ Crypto, framing, transport — offline-verified (byte-exact vs reference vectors).
-- ✅ Screen mirror — live over LAN and USB (raw HEVC frames delivered).
-- ✅ Control input — mouse/scroll over `/mirror/control`.
-- 🔧 Clipboard — handshake + 8904 relay live; PC→phone working, phone→PC under test.
-- ⏳ Pending — clipboard images (vdfs), verify-code relay, LAN clipboard.
+Runs headless over **USB, LAN, and remote**; 60 offline unit tests; exercised
+against a real device.
+
+- ✅ Crypto / framing / transport — offline unit tests (CBC "sign" KAT, GCM KAT,
+  frame round-trips). Real on-device conformance vectors are kept locally, not in-tree.
+- ✅ Screen mirror — raw HEVC frames over LAN and USB.
+- ✅ Control input — mouse / scroll / keyboard over `/mirror/control`.
+- ✅ Clipboard — two-way text **and** images (images via vdfs, AES-GCM 12-byte nonce).
+- ✅ SMS verify-code relay.
+- ✅ Phone notification relay.
+- ✅ Device info — model / OS / storage capacity.
+- ✅ File browse — `ls` (per-category listing) + `pull` (download) over the mdfs gateway.
+- ✅ SwiftUI macOS frontend via `pcsuite-ffi` (see the PcsuiteMirror app).
+- ⏳ Deferred — non-macOS frontends (Windows/Linux), Flutter/IPC layer.
 
 ## Configuration
 
