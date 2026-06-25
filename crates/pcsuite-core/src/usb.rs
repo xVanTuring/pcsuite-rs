@@ -24,6 +24,12 @@ pub struct UsbConfig {
     pub adb_path: Option<String>,
     pub token: Option<String>,
     pub conn_id: Option<String>,
+    /// PC display name handed to the phone's `AdbPortalService` (`--es pc_name` /
+    /// `--es user_name`). The phone shows it during the USB connect; empty/None
+    /// falls back to a generic label. The persistent "已连接" card name comes from
+    /// the `/base-info` `pc_name` (see [`crate::device::fetch`]) — set both to the
+    /// same value so the connect-time and connected names match.
+    pub pc_name: Option<String>,
 }
 
 /// Result of a successful [`prepare`]: drive `Screen::open("127.0.0.1", &token, …)`.
@@ -31,6 +37,13 @@ pub struct UsbSession {
     pub adb: String,
     pub token: String,
     pub conn_id: String,
+}
+
+/// Single-quote a string for the *device* shell that `adb shell` hands the command
+/// to, so spaces/apostrophes in a `--es` value can't split or break the `am` line.
+/// Wraps in `'…'` and rewrites each embedded `'` as `'\''`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 fn random_token() -> String {
@@ -61,6 +74,16 @@ pub async fn prepare(cfg: UsbConfig) -> Result<UsbSession> {
     let conn_id = cfg
         .conn_id
         .unwrap_or_else(|| format!("pcsuite_{}", epoch_secs()));
+    // PC display name for the phone's AdbPortalService; blank/None → generic label.
+    // `adb shell` joins the post-`shell` argv with spaces and the *device* shell
+    // re-splits them, so a name with spaces/apostrophes (e.g. "xvan's MacBook Pro")
+    // would break the `am` command and the portal service never starts. Single-quote
+    // it for the remote shell so it arrives as one `--es` value.
+    let pc_name = sh_quote(
+        &cfg.pc_name
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "pcsuite".to_string()),
+    );
 
     // require a device in the "device" state
     let devices = adb::run(&adb, &["devices"]).await?;
@@ -99,8 +122,8 @@ pub async fn prepare(cfg: UsbConfig) -> Result<UsbSession> {
         &adb,
         &[
             "shell", "am", "start-service", "-n", "com.vivo.pcsuite/.service.AdbPortalService",
-            "--es", "from", "pc", "--ei", "foreground", "0", "--es", "pc_name", "pcsuite",
-            "--es", "token", &token, "--es", "user_name", "pcsuite", "--es", "connectionId",
+            "--es", "from", "pc", "--ei", "foreground", "0", "--es", "pc_name", &pc_name,
+            "--es", "token", &token, "--es", "user_name", &pc_name, "--es", "connectionId",
             &conn_id, "--ei", "isTransferConnect", "0",
         ],
     )

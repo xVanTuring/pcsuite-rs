@@ -251,7 +251,11 @@ async fn resolve_transport(args: &Args, feature: &str) -> Result<Transport> {
     }
     if args.usb {
         tracing::info!(feature, "USB (adb) mode");
-        let session = usb::prepare(UsbConfig::default()).await?;
+        let session = usb::prepare(UsbConfig {
+            pc_name: Some(pcsuite_core::config::default_identity().device_name),
+            ..UsbConfig::default()
+        })
+        .await?;
         Ok(Transport {
             data_ip: "127.0.0.1".into(),
             token: session.token,

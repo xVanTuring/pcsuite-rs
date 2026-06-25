@@ -689,7 +689,21 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
     let id = config::default_identity();
     let (u, session) = rt()
         .block_on(async {
-            let u = usb::prepare(UsbConfig::default()).await?;
+            let u = usb::prepare(UsbConfig {
+                pc_name: Some(id.device_name.clone()),
+                ..UsbConfig::default()
+            })
+            .await?;
+            // Best-effort, bounded: announce our display name *before* the WS comes
+            // up (which freezes the phone's "已连接" notification text). USB has no
+            // earlier name channel that reaches that notification; failures are
+            // harmless (the post-connect device-info fetch still sets the in-app
+            // name). Time-boxed so it can never stall the connect.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                pcsuite_core::device::announce_pc_name("127.0.0.1", &u.token, &id.device_name),
+            )
+            .await;
             let session = Session::connect("127.0.0.1", &u.token).await?;
             Ok::<_, anyhow::Error>((u, session))
         })

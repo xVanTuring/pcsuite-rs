@@ -50,14 +50,48 @@ pub async fn fetch(host: &str, token: &str, device_id: &str) -> Result<DeviceInf
     // The controller only needs a non-null request body; identify ourselves but omit
     // `token` — a non-empty PC token that mismatched the phone's stored remote token
     // makes it bail early, whereas an empty token skips that equality check.
+    //
+    // `pc_name` is the PC display name the phone shows on its "已连接 \"%s\"" card:
+    // its `ControlPhoneInfoController` does `F0(baseInfoBean.getPcHostname())` —
+    // `pcHostname` is `@SerializedName("pc_name")` — and that field IS the card text.
+    // Omitting it makes Gson leave it null, so the phone overwrites the connect-time
+    // name with `"null"` (USB has no connect-time name → `""`). Send our device name
+    // here so every transport (USB / QR / LAN) shows the real PC name post-connect.
     let body = json!({
         "pcDeviceId": config::clip_pc_id(),
         "pcSystemType": "mac",
+        "pc_name": config::default_identity().device_name,
     });
     let reply = mdfs::post_json(host, token, device_id, "/base-info", &body)
         .await
         .context("/base-info")?;
     Ok(parse_base_info(&reply))
+}
+
+/// Best-effort *early* PC-name announce, for the USB path only.
+///
+/// The phone freezes its "已连接 \"%s\"" notification text at its internal
+/// connect-success event (which fires when the heartbeat WS comes up), reading a
+/// field it only learns from `/base-info`'s `pc_name`. For USB nothing sets that
+/// field earlier (unlike LAN/QR, whose connect dialog seeds it), so the normal
+/// post-connect [`fetch`] lands too late and the notification keeps the stale empty
+/// name. Sending a minimal `/base-info` here — after the USB `/version` handshake
+/// but *before* opening the WS — sets the name in time.
+///
+/// Routes by path with an empty `deviceId` header (same as the USB `/version`
+/// probe); the phone applies `pc_name` before any token check, so the bare token is
+/// fine. The caller ignores the result — on any failure the later [`fetch`] still
+/// updates the in-app device panel / "设备互联" name.
+pub async fn announce_pc_name(host: &str, token: &str, pc_name: &str) -> Result<()> {
+    let body = json!({
+        "pcDeviceId": config::clip_pc_id(),
+        "pcSystemType": "mac",
+        "pc_name": pc_name,
+    });
+    mdfs::post_json(host, token, "", "/base-info", &body)
+        .await
+        .context("/base-info (early announce)")?;
+    Ok(())
 }
 
 /// Extract a [`DeviceInfo`] from a `/base-info` reply. Unwraps the `ChannelBean`
