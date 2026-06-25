@@ -486,7 +486,36 @@ async fn on_frame(frame: &RuyingFrame, shared: &SharedRef, backend: &Arc<dyn Cli
                 }
             }
         }
-        100 => tracing::debug!(cmd = %preview(&text), "[phone] command frame"),
+        100 => {
+            // 8904 command bus (phone↔PC). Logged at info so the next live
+            // connection shows exactly which commands the phone sends.
+            tracing::info!(cmd = %preview(&text), "[phone] command frame");
+            // The phone announces itself with command:1 (carrying its localDevice +
+            // key/iv) right after reverse-connecting. The original relay answers with
+            // command:6, which registers the PC as a routable device on the phone
+            // (v.n()+r.K()+setCipherKey → "pc notify connect"). Without this, the
+            // phone never pushes *change* clipboards back to us (only the one-shot
+            // command:5 response). Echo localDevice → remoteDevice, mark online.
+            if let Some(local_device) = clip::command_local_device(&text) {
+                let (pc_key, pc_iv, phone_id, out) = {
+                    let sh = shared.lock().await;
+                    (sh.pc_key.clone(), sh.pc_iv.clone(), sh.phone_id.clone(), sh.outgoing.clone())
+                };
+                let pc_id_owned = config::clip_pc_id();
+                let payload = clip::command_register_remote(&local_device);
+                match build_frame(payload.as_bytes(), &pc_key, &pc_iv, &phone_id, &pc_id_owned, 100) {
+                    Ok(frame) => {
+                        if let Some(out) = out {
+                            let _ = out.send(frame).await;
+                            tracing::info!("[8904] command:1 → replied command:6 (register PC as clipboard partner)");
+                        } else {
+                            tracing::warn!("[8904] got command:1 but no outgoing channel to reply command:6");
+                        }
+                    }
+                    Err(e) => tracing::warn!(err = %e, "[8904] build command:6 reply failed"),
+                }
+            }
+        }
         8 => {
             // byteC=8 = MediaStore index (the data behind the original's file page).
             // Opt-in dump (PCSUITE_INDEX_DUMP=1) so we can reverse its format.

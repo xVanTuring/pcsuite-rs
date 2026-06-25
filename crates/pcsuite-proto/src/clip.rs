@@ -180,6 +180,34 @@ pub fn command_request_clipboard() -> String {
     json!({"command": 5, "packageName": "clipboard"}).to_string()
 }
 
+/// If `text` is the phone's `command:1` announce (byteC=100), return its raw
+/// `localDevice` string (a stringified JSON of `{device, key, iv}`). The phone sends
+/// this right after reverse-connecting to our 8904 server; we must echo it back as a
+/// `command:6` so the phone registers us as a routable clipboard partner.
+pub fn command_local_device(text: &str) -> Option<String> {
+    let j: Value = serde_json::from_str(text).ok()?;
+    if j.get("command")?.as_i64()? != 1 {
+        return None;
+    }
+    // `localDevice` is itself a JSON *string*; pass it through verbatim.
+    let ld = j.get("localDevice")?.as_str()?;
+    if ld.is_empty() {
+        return None;
+    }
+    Some(ld.to_string())
+}
+
+/// Build the `command:6` device-registration reply (byteC=100): echo the phone's
+/// `localDevice` (from its `command:1`) as an online `remoteDevice`. On the phone this
+/// drives `v.n()`+`r.K()`+`AesCipherUtil.setCipherKey()` → the "pc notify connect" path
+/// (`handlePCConnect`) that makes the phone push subsequent clipboard *changes* to us.
+/// `remote_device` is carried as a stringified JSON, matching the original relay.
+/// (Disconnect is signalled out-of-band by the control-WS `"close"` message, not by an
+/// `isOnline:false` variant of this frame — see [`crate::clip`] / `Session`.)
+pub fn command_register_remote(remote_device: &str) -> String {
+    json!({"command": 6, "isOnline": true, "remoteDevice": remote_device}).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +247,36 @@ mod tests {
         // empty text -> None
         let e = clip_text_json("pc0000", "mac", "nick", "", 0);
         assert!(clip_text_from_json(&e).is_none());
+    }
+
+    #[test]
+    fn command1_to_command6_echo() {
+        // phone announce (command:1) carrying a stringified localDevice, as seen in
+        // the original relay log (.cw4_relay.log:18).
+        let local = r#"{"device":"{\"bleDeviceId\":\"52467a\"}","key":"TQsht3oNUbllOyIpUozeGsSaUv7ie9Sg","iv":"wj4cokMJbmL9EX8I"}"#;
+        let cmd1 = json!({
+            "command": 1,
+            "deviceId": "52467a",
+            "anywhereSwitch": false,
+            "clipboardSwitch": true,
+            "localDevice": local,
+        })
+        .to_string();
+        let ld = command_local_device(&cmd1).expect("localDevice");
+        assert_eq!(ld, local);
+
+        // the command:6 reply must carry it back verbatim as a *string* remoteDevice
+        let reply = command_register_remote(&ld);
+        let v: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["command"], 6);
+        assert_eq!(v["isOnline"], true);
+        assert_eq!(v["remoteDevice"].as_str(), Some(local));
+
+        // non-command:1 frames (command:5 / command:6) yield no echo
+        assert!(command_local_device(&command_request_clipboard()).is_none());
+        assert!(command_local_device(&reply).is_none());
+        // command:1 without a localDevice (our own stub announce) yields none
+        assert!(command_local_device(&command_announce("pc0000")).is_none());
     }
 
     #[test]

@@ -25,12 +25,37 @@ void* __swift_bridge__$Vec_PcSession$get_mut(void* vec_ptr, uintptr_t index);
 uintptr_t __swift_bridge__$Vec_PcSession$len(void* vec_ptr);
 void* __swift_bridge__$Vec_PcSession$as_ptr(void* vec_ptr);
 
+typedef struct PcPairing PcPairing;
+void __swift_bridge__$PcPairing$_free(void* self);
+
+void* __swift_bridge__$Vec_PcPairing$new(void);
+void __swift_bridge__$Vec_PcPairing$drop(void* vec_ptr);
+void __swift_bridge__$Vec_PcPairing$push(void* vec_ptr, void* item_ptr);
+void* __swift_bridge__$Vec_PcPairing$pop(void* vec_ptr);
+void* __swift_bridge__$Vec_PcPairing$get(void* vec_ptr, uintptr_t index);
+void* __swift_bridge__$Vec_PcPairing$get_mut(void* vec_ptr, uintptr_t index);
+uintptr_t __swift_bridge__$Vec_PcPairing$len(void* vec_ptr);
+void* __swift_bridge__$Vec_PcPairing$as_ptr(void* vec_ptr);
+
+typedef struct PcPaired PcPaired;
+void __swift_bridge__$PcPaired$_free(void* self);
+
+void* __swift_bridge__$Vec_PcPaired$new(void);
+void __swift_bridge__$Vec_PcPaired$drop(void* vec_ptr);
+void __swift_bridge__$Vec_PcPaired$push(void* vec_ptr, void* item_ptr);
+void* __swift_bridge__$Vec_PcPaired$pop(void* vec_ptr);
+void* __swift_bridge__$Vec_PcPaired$get(void* vec_ptr, uintptr_t index);
+void* __swift_bridge__$Vec_PcPaired$get_mut(void* vec_ptr, uintptr_t index);
+uintptr_t __swift_bridge__$Vec_PcPaired$len(void* vec_ptr);
+void* __swift_bridge__$Vec_PcPaired$as_ptr(void* vec_ptr);
+
 void* __swift_bridge__$PcScreen$next_frame(void* self);
 void __swift_bridge__$PcScreen$stop(void* self);
 void* __swift_bridge__$PcScreen$next_privacy_event(void* self);
 void* __swift_bridge__$PcScreen$next_input_cursor(void* self);
 struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$start_screen(void* self, int64_t max_size);
 void* __swift_bridge__$PcSession$enable_clipboard(void* self, bool recv, bool send);
+void __swift_bridge__$PcSession$stop_clipboard(void* self);
 void __swift_bridge__$PcSession$enable_verify(void* self);
 void* __swift_bridge__$PcSession$next_verify_code(void* self);
 void __swift_bridge__$PcSession$stop_verify(void* self);
@@ -53,5 +78,16 @@ void __swift_bridge__$pcsuite_set_seed(void* phone_ip, void* seed);
 void __swift_bridge__$pcsuite_set_clip_id(void* clip_id);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_usb(void);
 struct __private__ResultPtrAndPtr __swift_bridge__$pcsuite_connect_lan(void* phone_ip, bool remote);
+void* __swift_bridge__$pcsuite_pair_begin(void* lip);
+void* __swift_bridge__$PcPairing$qr_url(void* self);
+void* __swift_bridge__$PcPairing$lan_ip(void* self);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcPairing$wait_phone(void* self, uint32_t timeout_ms);
+void __swift_bridge__$PcPairing$cancel(void* self);
+void* __swift_bridge__$PcPaired$phone_ip(void* self);
+void* __swift_bridge__$PcPaired$ble_id(void* self);
+void* __swift_bridge__$PcPaired$device_name(void* self);
+void* __swift_bridge__$PcPaired$vivo_account(void* self);
+void* __swift_bridge__$PcPaired$device_type(void* self);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcPaired$connect(void* self);
 
 

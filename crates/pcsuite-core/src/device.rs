@@ -33,7 +33,14 @@ pub struct DeviceInfo {
     pub width_pixels: i64,
     pub height_pixels: i64,
     pub fold_screen: bool,
+    /// Masked login account, e.g. "138****000".
     pub vivo_account: String,
+    /// Real vivo-account openId (16-hex) — the value the phone matches LAN sign +
+    /// super-clipboard against. The phone returns it here (`BaseInfoBean.openid`,
+    /// from `BBKAccountManager.getOpenid()`), so a session that connected without a
+    /// pre-set openId (e.g. QR pairing) can learn it and self-fill. Empty if the
+    /// phone isn't logged in.
+    pub open_id: String,
 }
 
 /// Fetch the phone's `/base-info` over the 10380 control-HTTP gateway. `device_id`
@@ -74,6 +81,7 @@ fn parse_base_info(reply: &Value) -> DeviceInfo {
         height_pixels: int("heightPixels"),
         fold_screen: d.get("isFoldScreen").and_then(Value::as_bool).unwrap_or(false),
         vivo_account: text("vivoAccount"),
+        open_id: text("openid"), // BaseInfoBean.openid — lowercase, no @SerializedName
     }
 }
 
@@ -100,7 +108,8 @@ mod tests {
                 "totalStorage": "512",
                 "availableStorage": "327.55",
                 "availableByte": 327_553_000_000u64,
-                "vivoAccount": "138****000"
+                "vivoAccount": "138****000",
+                "openid": "66ee212fde7a06a1"
             }
         });
         let d = parse_base_info(&reply);
@@ -111,6 +120,8 @@ mod tests {
         assert_eq!(d.product, "PD2505");
         assert_eq!(d.width_pixels, 1440);
         assert!(!d.fold_screen);
+        assert_eq!(d.open_id, "66ee212fde7a06a1");
+        assert_eq!(d.vivo_account, "138****000");
     }
 
     #[test]

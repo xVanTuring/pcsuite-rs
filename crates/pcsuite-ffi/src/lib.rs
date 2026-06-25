@@ -26,8 +26,8 @@ use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 
 use pcsuite_core::{
-    config, register, usb, ClipboardConfig, InputHandle, MouseAction, MouseButton, RegisterConfig,
-    Registration, ScreenParams, ScreenStream, Session, UsbConfig,
+    config, pair, register, usb, ClipboardConfig, InputHandle, MouseAction, MouseButton,
+    PhoneNotify, RegisterConfig, Registration, ScreenParams, ScreenStream, Session, UsbConfig,
 };
 
 mod clipboard_mac;
@@ -73,6 +73,14 @@ mod ffi {
         // recv = apply the phone's clipboard to this Mac (phone→PC); send = push this
         // Mac's clipboard to the phone (PC→phone). Pass both true for bidirectional.
         fn enable_clipboard(&self, recv: bool, send: bool) -> Result<(), String>;
+        // Gracefully disconnect before teardown: send the literal "close" on the
+        // control WS, exactly as the official app does (ws.send("close")). The phone
+        // runs its full PC-disconnect cleanup on it. REQUIRED for clean reconnects:
+        // without it a bare socket close leaves stale phone-side state and phone→PC
+        // clipboard sync silently dies on the next connect. Call on user-initiated
+        // disconnect, before releasing the session. Blocking but fast (~200ms flush);
+        // no-op if the link is already dead.
+        fn stop_clipboard(&self);
         // Arm SMS verify-code relay; then poll next_verify_code().
         fn enable_verify(&self);
         // Block for the next SMS code as "code\tsign"; empty = session ended OR
@@ -147,6 +155,43 @@ mod ffi {
         fn pcsuite_connect_usb() -> Result<PcSession, String>;
         // Connect over LAN/Tailscale. remote=true uses connectType=1 (no seed).
         fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, String>;
+        // Begin QR pairing (local ls=true variant — pure LAN, no cloud/seed/10191).
+        // `lip` = this machine's LAN IP to advertise in the QR; pass "" to auto-detect.
+        // Render qr_url() as a QR for the phone to scan via PCSuite 扫码连接电脑.
+        fn pcsuite_pair_begin(lip: String) -> PcPairing;
+    }
+
+    extern "Rust" {
+        type PcPairing;
+        // The QR payload to render (the phone scans it; it carries a self-made token
+        // the phone stores, plus ls=true + our lip so it reports back over the LAN).
+        fn qr_url(&self) -> String;
+        // The LAN IP chosen for the QR (where the phone POSTs notifyConnection).
+        fn lan_ip(&self) -> String;
+        // Block up to timeout_ms for the phone to scan and report its IP to :9199.
+        // Returns a PcPaired (call connect() on it) or an error on timeout. Call off
+        // the main thread.
+        fn wait_phone(&self, timeout_ms: u32) -> Result<PcPaired, String>;
+        // Abort an in-flight wait_phone() from another thread: it returns an error
+        // within ~300ms and frees the :9199 listener so a re-pair can rebind.
+        fn cancel(&self);
+    }
+
+    extern "Rust" {
+        type PcPaired;
+        // The phone's LAN IP (the data-plane host).
+        fn phone_ip(&self) -> String;
+        // The phone's device id (bleId, e.g. "52467a") — the clipboard routing id.
+        fn ble_id(&self) -> String;
+        // The phone's display name (e.g. "iQOO 15").
+        fn device_name(&self) -> String;
+        // The phone's logged-in account (masked, e.g. "173****991").
+        fn vivo_account(&self) -> String;
+        // "phone" or "pad".
+        fn device_type(&self) -> String;
+        // Open the data plane over the paired phone — the QR token is already trusted,
+        // so this skips the 10191 sign. Blocks ~1s; returns a PcSession. Off-main.
+        fn connect(&self) -> Result<PcSession, String>;
     }
 }
 
@@ -187,6 +232,10 @@ pub struct PcSession {
     // Cached phone mobileDeviceId for /base-info; resolved lazily without re-sending
     // a SHADOW startup when one is already on the wire (see resolve_device_id).
     device_id_cache: std::sync::Mutex<String>,
+    // True once clipboard is enabled. While set, resolve_device_id() must NOT send its
+    // own SHADOW startup (it would rotate the clipboard keys mid-handshake and break
+    // phone→PC sync) — it waits for the clipboard handshake's retained reply instead.
+    clipboard_active: std::sync::atomic::AtomicBool,
     // Liveness of the shared control WS; reads `true` once the connection is lost.
     dead_rx: tokio::sync::Mutex<tokio::sync::watch::Receiver<bool>>,
     // Set by stop_watch(); the disconnect watcher checks it between short timeouts.
@@ -317,7 +366,7 @@ impl PcSession {
             pc_ip: self.pc_ip.clone(),
             bind_addr: self.bind_addr.clone(),
             token: self.token.clone(),
-            open_id: self.open_id.clone(),
+            open_id: self.resolve_clip_open_id(),
             device_name: self.device_name.clone(),
             connect_type: self.connect_type.clone(),
             vdfs_fetch_host: self.vdfs_fetch_host.clone(),
@@ -325,11 +374,40 @@ impl PcSession {
             recv_from_phone: recv,
             send_to_phone: send,
         };
-        rt().block_on(async {
+        let r = rt().block_on(async {
             let mut s = self.session.lock().await;
             s.enable_clipboard(cfg, std::sync::Arc::new(MacClipboard)).await
         })
-        .map_err(|e| format!("{e:#}"))
+        .map_err(|e| format!("{e:#}"));
+        if r.is_ok() {
+            // From now on resolve_device_id() must reuse the clipboard handshake's
+            // SHADOW reply, never send a competing startup (it rotates the clip keys).
+            self.clipboard_active.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+
+    fn stop_clipboard(&self) {
+        rt().block_on(async {
+            let s = self.session.lock().await;
+            s.shutdown_clipboard().await;
+        });
+    }
+
+    /// The account openId for the cowork clipboard `SHADOW_LIKE` handshake (the phone
+    /// gates relay-clipboard on it matching its account). Prefer a configured value —
+    /// including one learned from `/base-info` on an earlier connect and applied via
+    /// `set_identity` — over the connect-time snapshot, so a re-pair after the openId
+    /// was learned uses the real value. We deliberately do NOT fetch `/base-info` here:
+    /// before the cowork handshake the phone answers it very slowly (~20s), which would
+    /// stall `connect`. openId is learned post-connect instead (see `device_info` /
+    /// the app's `autoFillOpenID`) and takes effect from the next connect.
+    fn resolve_clip_open_id(&self) -> String {
+        if config::has_open_id() {
+            config::default_identity().open_id
+        } else {
+            self.open_id.clone()
+        }
     }
 
     fn enable_verify(&self) {
@@ -416,7 +494,7 @@ impl PcSession {
             .block_on(pcsuite_core::device::fetch(&self.data_ip, &self.token, &device_id))
             .map_err(|e| format!("{e:#}"))?;
         Ok(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             info.mobile_device_name,
             info.mobile_brand,
             info.product,
@@ -429,6 +507,7 @@ impl PcSession {
             info.available_storage_gb,
             info.available_bytes,
             info.vivo_account,
+            info.open_id,
         ))
     }
 
@@ -443,12 +522,32 @@ impl PcSession {
                 return Ok(c.clone());
             }
         }
+        let clip_active = self.clipboard_active.load(std::sync::atomic::Ordering::Relaxed);
         let id = rt()
             .block_on(async {
-                let s = self.session.lock().await;
-                if let Some(id) = s.known_device_id() {
-                    return Ok::<String, anyhow::Error>(id);
+                // Fast path: the (clipboard) handshake already retained the phone's
+                // SHADOW reply.
+                {
+                    let s = self.session.lock().await;
+                    if let Some(id) = s.known_device_id() {
+                        return Ok::<String, anyhow::Error>(id);
+                    }
                 }
+                // With clipboard active a startup is in flight; wait for its reply
+                // rather than sending our own (a second startup rotates the clipboard
+                // keys mid-handshake → phone→PC sync dies). Poll the retained reply.
+                if clip_active {
+                    for _ in 0..50 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        let s = self.session.lock().await;
+                        if let Some(id) = s.known_device_id() {
+                            return Ok(id);
+                        }
+                    }
+                    anyhow::bail!("device id unavailable: clipboard handshake produced no SHADOW reply within 5s (not sending a competing startup, which would rotate the clipboard keys)");
+                }
+                // No clipboard in flight (e.g. browse-only) → safe to ask ourselves.
+                let s = self.session.lock().await;
                 let identity = config::default_identity();
                 let p = s.phone_info(&self.pc_ip, &self.connect_type, &identity).await?;
                 Ok(p.mobile_device_id)
@@ -604,6 +703,7 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
         notify_rx: std::sync::Mutex::new(None),
         notify_stop: std::sync::atomic::AtomicBool::new(false),
         device_id_cache: std::sync::Mutex::new(String::new()),
+        clipboard_active: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
         token: u.token,
@@ -621,7 +721,6 @@ fn pcsuite_connect_usb() -> Result<PcSession, String> {
 }
 
 fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, String> {
-    let id = config::default_identity();
     let stored_seed = if remote {
         None
     } else {
@@ -644,9 +743,22 @@ fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, Stri
             Ok::<_, anyhow::Error>((reg, token, session))
         })
         .map_err(|e| format!("{e:#}"))?;
+    Ok(build_wlan_session(session, token, phone_ip, Some(reg)))
+}
+
+/// Build a WLAN-flavoured [`PcSession`] from an already-connected control session.
+/// Shared by `pcsuite_connect_lan` (with its SSDP-presence `Registration`) and the
+/// QR-pairing `connect()` (no registration — the QR delivered the token).
+fn build_wlan_session(
+    session: Session,
+    token: String,
+    phone_ip: String,
+    reg: Option<Registration>,
+) -> PcSession {
+    let id = config::default_identity();
     let pc_ip = local_ip_toward(&phone_ip).unwrap_or_else(|| "0.0.0.0".into());
     let dead_rx = session.dead_signal();
-    Ok(PcSession {
+    PcSession {
         session: tokio::sync::Mutex::new(session),
         input: std::sync::Mutex::new(None),
         verify_rx: std::sync::Mutex::new(None),
@@ -654,6 +766,7 @@ fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, Stri
         notify_rx: std::sync::Mutex::new(None),
         notify_stop: std::sync::atomic::AtomicBool::new(false),
         device_id_cache: std::sync::Mutex::new(String::new()),
+        clipboard_active: std::sync::atomic::AtomicBool::new(false),
         dead_rx: tokio::sync::Mutex::new(dead_rx),
         watch_stop: std::sync::atomic::AtomicBool::new(false),
         token,
@@ -666,6 +779,110 @@ fn pcsuite_connect_lan(phone_ip: String, remote: bool) -> Result<PcSession, Stri
         open_id: id.open_id,
         device_name: id.device_name,
         usb_adb: None,
-        _reg: Some(reg),
-    })
+        _reg: reg,
+    }
+}
+
+// ───────────────────────────── QR pairing ─────────────────────────────
+
+/// This machine's LAN IPv4 (en0/en1/en2), skipping Tailscale (100.x). macOS path via
+/// `ipconfig getifaddr`; falls back to the route toward a private LAN address.
+fn local_lan_ip() -> Option<String> {
+    for iface in ["en0", "en1", "en2"] {
+        if let Ok(out) = std::process::Command::new("ipconfig")
+            .args(["getifaddr", iface])
+            .output()
+        {
+            let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !ip.is_empty() && !ip.starts_with("100.") {
+                return Some(ip);
+            }
+        }
+    }
+    local_ip_toward("192.168.0.1").filter(|ip| !ip.starts_with("100."))
+}
+
+/// In-progress QR pairing: the self-made token + the QR payload to show. Holds no
+/// network state — the listener only runs while [`PcPairing::wait_phone`] is awaited.
+pub struct PcPairing {
+    token: String,
+    url: String,
+    lip: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+fn pcsuite_pair_begin(lip: String) -> PcPairing {
+    let id = config::default_identity();
+    let lip = if lip.trim().is_empty() {
+        local_lan_ip().unwrap_or_else(|| "0.0.0.0".into())
+    } else {
+        lip
+    };
+    let token = pair::random_token();
+    let url = pair::qr_url(&token, &lip, &id);
+    PcPairing {
+        token,
+        url,
+        lip,
+        stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+impl PcPairing {
+    fn qr_url(&self) -> String {
+        self.url.clone()
+    }
+
+    fn lan_ip(&self) -> String {
+        self.lip.clone()
+    }
+
+    fn wait_phone(&self, timeout_ms: u32) -> Result<PcPaired, String> {
+        let dur = std::time::Duration::from_millis(timeout_ms as u64);
+        let notify = rt()
+            .block_on(pair::wait_for_phone_until(pair::NOTIFY_PORT, dur, &self.stop))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(PcPaired {
+            token: self.token.clone(),
+            notify,
+        })
+    }
+
+    fn cancel(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A phone that scanned the QR and reported its IP. Call [`PcPaired::connect`] to
+/// open the data plane.
+pub struct PcPaired {
+    token: String,
+    notify: PhoneNotify,
+}
+
+impl PcPaired {
+    fn phone_ip(&self) -> String {
+        self.notify.phone_ip.clone()
+    }
+    fn ble_id(&self) -> String {
+        self.notify.ble_id.clone()
+    }
+    fn device_name(&self) -> String {
+        self.notify.device_name.clone()
+    }
+    fn vivo_account(&self) -> String {
+        self.notify.vivo_account.clone()
+    }
+    fn device_type(&self) -> String {
+        self.notify.device_type.clone()
+    }
+
+    fn connect(&self) -> Result<PcSession, String> {
+        let phone_ip = self.notify.phone_ip.clone();
+        let token = self.token.clone();
+        let session = rt()
+            .block_on(Session::connect(&phone_ip, &token))
+            .map_err(|e| format!("{e:#}"))?;
+        Ok(build_wlan_session(session, token, phone_ip, None))
+    }
 }

@@ -19,6 +19,9 @@ public func pcsuite_connect_usb() throws -> PcSession {
 public func pcsuite_connect_lan<GenericIntoRustString: IntoRustString>(_ phone_ip: GenericIntoRustString, _ remote: Bool) throws -> PcSession {
     try { let val = __swift_bridge__$pcsuite_connect_lan({ let rustString = phone_ip.intoRustString(); rustString.isOwned = false; return rustString.ptr }(), remote); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
 }
+public func pcsuite_pair_begin<GenericIntoRustString: IntoRustString>(_ lip: GenericIntoRustString) -> PcPairing {
+    PcPairing(ptr: __swift_bridge__$pcsuite_pair_begin({ let rustString = lip.intoRustString(); rustString.isOwned = false; return rustString.ptr }()))
+}
 
 public class PcScreen: PcScreenRefMut {
     var isOwned: Bool = true
@@ -146,6 +149,10 @@ extension PcSessionRef {
         try { let val = __swift_bridge__$PcSession$enable_clipboard(ptr, recv, send); if val != nil { throw RustString(ptr: val!) } else { return } }()
     }
 
+    public func stop_clipboard() {
+        __swift_bridge__$PcSession$stop_clipboard(ptr)
+    }
+
     public func enable_verify() {
         __swift_bridge__$PcSession$enable_verify(ptr)
     }
@@ -252,6 +259,198 @@ extension PcSession: Vectorizable {
 
     public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
         __swift_bridge__$Vec_PcSession$len(vecPtr)
+    }
+}
+
+
+public class PcPairing: PcPairingRefMut {
+    var isOwned: Bool = true
+
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+
+    deinit {
+        if isOwned {
+            __swift_bridge__$PcPairing$_free(ptr)
+        }
+    }
+}
+public class PcPairingRefMut: PcPairingRef {
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+}
+public class PcPairingRef {
+    var ptr: UnsafeMutableRawPointer
+
+    public init(ptr: UnsafeMutableRawPointer) {
+        self.ptr = ptr
+    }
+}
+extension PcPairingRef {
+    public func qr_url() -> RustString {
+        RustString(ptr: __swift_bridge__$PcPairing$qr_url(ptr))
+    }
+
+    public func lan_ip() -> RustString {
+        RustString(ptr: __swift_bridge__$PcPairing$lan_ip(ptr))
+    }
+
+    public func wait_phone(_ timeout_ms: UInt32) throws -> PcPaired {
+        try { let val = __swift_bridge__$PcPairing$wait_phone(ptr, timeout_ms); if val.is_ok { return PcPaired(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+
+    public func cancel() {
+        __swift_bridge__$PcPairing$cancel(ptr)
+    }
+}
+extension PcPairing: Vectorizable {
+    public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
+        __swift_bridge__$Vec_PcPairing$new()
+    }
+
+    public static func vecOfSelfFree(vecPtr: UnsafeMutableRawPointer) {
+        __swift_bridge__$Vec_PcPairing$drop(vecPtr)
+    }
+
+    public static func vecOfSelfPush(vecPtr: UnsafeMutableRawPointer, value: PcPairing) {
+        __swift_bridge__$Vec_PcPairing$push(vecPtr, {value.isOwned = false; return value.ptr;}())
+    }
+
+    public static func vecOfSelfPop(vecPtr: UnsafeMutableRawPointer) -> Optional<Self> {
+        let pointer = __swift_bridge__$Vec_PcPairing$pop(vecPtr)
+        if pointer == nil {
+            return nil
+        } else {
+            return (PcPairing(ptr: pointer!) as! Self)
+        }
+    }
+
+    public static func vecOfSelfGet(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcPairingRef> {
+        let pointer = __swift_bridge__$Vec_PcPairing$get(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcPairingRef(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfGetMut(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcPairingRefMut> {
+        let pointer = __swift_bridge__$Vec_PcPairing$get_mut(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcPairingRefMut(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfAsPtr(vecPtr: UnsafeMutableRawPointer) -> UnsafePointer<PcPairingRef> {
+        UnsafePointer<PcPairingRef>(OpaquePointer(__swift_bridge__$Vec_PcPairing$as_ptr(vecPtr)))
+    }
+
+    public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
+        __swift_bridge__$Vec_PcPairing$len(vecPtr)
+    }
+}
+
+
+public class PcPaired: PcPairedRefMut {
+    var isOwned: Bool = true
+
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+
+    deinit {
+        if isOwned {
+            __swift_bridge__$PcPaired$_free(ptr)
+        }
+    }
+}
+public class PcPairedRefMut: PcPairedRef {
+    public override init(ptr: UnsafeMutableRawPointer) {
+        super.init(ptr: ptr)
+    }
+}
+public class PcPairedRef {
+    var ptr: UnsafeMutableRawPointer
+
+    public init(ptr: UnsafeMutableRawPointer) {
+        self.ptr = ptr
+    }
+}
+extension PcPairedRef {
+    public func phone_ip() -> RustString {
+        RustString(ptr: __swift_bridge__$PcPaired$phone_ip(ptr))
+    }
+
+    public func ble_id() -> RustString {
+        RustString(ptr: __swift_bridge__$PcPaired$ble_id(ptr))
+    }
+
+    public func device_name() -> RustString {
+        RustString(ptr: __swift_bridge__$PcPaired$device_name(ptr))
+    }
+
+    public func vivo_account() -> RustString {
+        RustString(ptr: __swift_bridge__$PcPaired$vivo_account(ptr))
+    }
+
+    public func device_type() -> RustString {
+        RustString(ptr: __swift_bridge__$PcPaired$device_type(ptr))
+    }
+
+    public func connect() throws -> PcSession {
+        try { let val = __swift_bridge__$PcPaired$connect(ptr); if val.is_ok { return PcSession(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    }
+}
+extension PcPaired: Vectorizable {
+    public static func vecOfSelfNew() -> UnsafeMutableRawPointer {
+        __swift_bridge__$Vec_PcPaired$new()
+    }
+
+    public static func vecOfSelfFree(vecPtr: UnsafeMutableRawPointer) {
+        __swift_bridge__$Vec_PcPaired$drop(vecPtr)
+    }
+
+    public static func vecOfSelfPush(vecPtr: UnsafeMutableRawPointer, value: PcPaired) {
+        __swift_bridge__$Vec_PcPaired$push(vecPtr, {value.isOwned = false; return value.ptr;}())
+    }
+
+    public static func vecOfSelfPop(vecPtr: UnsafeMutableRawPointer) -> Optional<Self> {
+        let pointer = __swift_bridge__$Vec_PcPaired$pop(vecPtr)
+        if pointer == nil {
+            return nil
+        } else {
+            return (PcPaired(ptr: pointer!) as! Self)
+        }
+    }
+
+    public static func vecOfSelfGet(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcPairedRef> {
+        let pointer = __swift_bridge__$Vec_PcPaired$get(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcPairedRef(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfGetMut(vecPtr: UnsafeMutableRawPointer, index: UInt) -> Optional<PcPairedRefMut> {
+        let pointer = __swift_bridge__$Vec_PcPaired$get_mut(vecPtr, index)
+        if pointer == nil {
+            return nil
+        } else {
+            return PcPairedRefMut(ptr: pointer!)
+        }
+    }
+
+    public static func vecOfSelfAsPtr(vecPtr: UnsafeMutableRawPointer) -> UnsafePointer<PcPairedRef> {
+        UnsafePointer<PcPairedRef>(OpaquePointer(__swift_bridge__$Vec_PcPaired$as_ptr(vecPtr)))
+    }
+
+    public static func vecOfSelfLen(vecPtr: UnsafeMutableRawPointer) -> UInt {
+        __swift_bridge__$Vec_PcPaired$len(vecPtr)
     }
 }
 

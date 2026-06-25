@@ -108,6 +108,21 @@ impl Session {
         self.control.clone()
     }
 
+    /// Gracefully disconnect: send the literal text `"close"` on the control WS before
+    /// this session is dropped, exactly as the official desktop app does on a
+    /// user-initiated disconnect (`WebSocketManager.sendCloseMessgaeToServer` →
+    /// `ws.send("close")`). The phone's `WebSocketController` runs its full
+    /// PC-disconnect cleanup on it (EventBus event 3 → de-registers the clipboard/vdfs
+    /// peer). Without it, a bare socket close leaves stale phone-side state and
+    /// phone→PC clipboard sync silently dies on the *next* connect. Best-effort; safe
+    /// if the link is already dead. Call before dropping the session, then pause
+    /// briefly so the control-WS owner task flushes it ahead of teardown.
+    pub async fn shutdown_clipboard(&self) {
+        let _ = self.control.send("close").await;
+        tracing::info!("[control] sent \"close\" (graceful disconnect, official-app parity)");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     /// The phone's `mobileDeviceId` if it has already been learned from a retained
     /// SHADOW reply (e.g. a running clipboard handshake or an earlier `phone_info`),
     /// without sending anything on the wire. Lets a feature that needs the device id

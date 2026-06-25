@@ -81,7 +81,7 @@ fn load() -> &'static UserConfig {
             .or_else(|| file.get("seed").and_then(|v| v.as_str()).map(str::to_owned));
 
         UserConfig {
-            open_id: pick("PCSUITE_OPEN_ID", "open_id", "0000000000000000"),
+            open_id: pick("PCSUITE_OPEN_ID", "open_id", OPEN_ID_PLACEHOLDER),
             pc_mac: pick("PCSUITE_PC_MAC", "pc_mac", "000000000000"),
             account: pick("PCSUITE_ACCOUNT", "account", ""),
             device_name: pick("PCSUITE_DEVICE_NAME", "device_name", "pcsuite-pc"),
@@ -158,6 +158,23 @@ pub fn set_identity(open_id: String, pc_mac: String, account: String, device_nam
 /// the phone registered for this PC at pairing, or phone→PC clipboard won't push.
 pub fn set_clip_pc_id(id: String) {
     overrides().write().unwrap().clip_pc_id = (!id.is_empty()).then_some(id);
+}
+
+/// Placeholder openId from the env/file/placeholder base — an obviously-fake value
+/// that won't pass the phone's account check. Keep in sync with `load()`.
+pub const OPEN_ID_PLACEHOLDER: &str = "0000000000000000";
+
+/// Override just the account openId (empty = clear). Used to self-fill the openId
+/// learned from the phone's `/base-info` when a session connected without one (e.g.
+/// QR pairing), so the cowork clipboard handshake carries the real account value.
+pub fn set_open_id(open_id: String) {
+    overrides().write().unwrap().open_id = (!open_id.is_empty()).then_some(open_id);
+}
+
+/// Whether a *real* account openId is configured (not empty, not the placeholder).
+pub fn has_open_id() -> bool {
+    let id = default_identity().open_id;
+    !id.is_empty() && id != OPEN_ID_PLACEHOLDER
 }
 
 /// The super-clipboard PC device id: runtime override, then env / config file,

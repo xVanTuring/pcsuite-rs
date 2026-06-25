@@ -23,14 +23,19 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use pcsuite_core::{
-    config, device, mdfs, register, run_clipboard, run_notify, run_verify, usb, ClipboardBackend,
-    ClipboardConfig, ListKind, NotifyConfig, RegisterConfig, Registration, Screen, ScreenParams,
-    Session, UsbConfig, VerifyConfig,
+    config, device, mdfs, pair, register, run_clipboard, run_notify, run_verify, usb,
+    ClipboardBackend, ClipboardConfig, ListKind, NotifyConfig, RegisterConfig, Registration, Screen,
+    ScreenParams, Session, UsbConfig, VerifyConfig,
 };
 
 struct Args {
     cmd: String,
     usb: bool,
+    /// Pair via QR (local `ls=true` variant): show a QR, wait for the phone to scan
+    /// and report its IP to `:9199/notifyConnection`, then run any feature over it.
+    pair: bool,
+    /// This machine's LAN IP to advertise in the QR (`lip=`); auto-detected if unset.
+    lip: Option<String>,
     phone: Option<String>,
     reg_ip: Option<String>,
     data_ip: Option<String>,
@@ -54,6 +59,8 @@ fn parse_args() -> Args {
     let mut a = Args {
         cmd,
         usb: false,
+        pair: false,
+        lip: None,
         phone: None,
         reg_ip: None,
         data_ip: None,
@@ -73,7 +80,12 @@ fn parse_args() -> Args {
         let flag = raw[i].clone();
         match flag.as_str() {
             "--usb" => a.usb = true,
+            "--pair" => a.pair = true,
             "--remote" => a.remote = true,
+            "--lip" => {
+                i += 1;
+                a.lip = raw.get(i).cloned();
+            }
             "--input-test" => a.input_test = true,
             "--screen" => a.feat_screen = true,
             "--clipboard" => a.feat_clipboard = true,
@@ -132,10 +144,13 @@ fn print_help() {
          \x20                                       (clipboard+verify+notify in the background; type\n\
          \x20                                        `screen on`/`screen off` at the prompt to\n\
          \x20                                        toggle mirroring. --screen starts it on.)\n\n\
-         Transports: --usb (adb forward/reverse) or --phone <IP> (LAN ConnectFlow;\n\
-         add --remote for connectType=1 / Tailscale). Over LAN the phone reverse-\n\
-         connects to this machine's IP for clipboard + images, so allow inbound\n\
-         8904/5679 if a firewall is on. --input-test scrolls to verify injection."
+         Transports: --usb (adb forward/reverse), --phone <IP> (LAN ConnectFlow;\n\
+         add --remote for connectType=1 / Tailscale), or --pair (QR: show a code,\n\
+         scan it with the phone's PCSuite 扫码连接电脑; no IP/seed needed — works on\n\
+         any command, e.g. `pcsuite screen --pair`, `pcsuite all --pair`; --lip <IP>\n\
+         overrides the auto-detected LAN IP). Over LAN the phone reverse-connects to\n\
+         this machine's IP for clipboard + images, so allow inbound 8904/5679 if a\n\
+         firewall is on. --input-test scrolls to verify injection."
     );
 }
 
@@ -198,6 +213,42 @@ struct Transport {
 /// servers on all interfaces and tells the phone our real interface IP; image
 /// fetch goes straight to `<phone>:5678`.
 async fn resolve_transport(args: &Args, feature: &str) -> Result<Transport> {
+    if args.pair {
+        // QR pairing (local ls=true): show a QR, wait for the phone to scan + report
+        // its IP, then run the normal LAN data plane with the QR-delivered token.
+        let identity = config::default_identity();
+        let lip = args
+            .lip
+            .clone()
+            .or_else(local_lan_ip)
+            .context("could not auto-detect this machine's LAN IP — pass --lip <IP>")?;
+        let token = pair::random_token();
+        let url = pair::qr_url(&token, &lip, &identity);
+        tracing::info!(feature, %lip, "QR pairing mode");
+        println!("\n📲 扫码配对 — 用手机 vivo PCSuite「扫码连接电脑」扫这个码:\n");
+        render_qr(&url);
+        println!("    (手动转码也行)  {url}");
+        println!("    本机 LAN IP(lip)={lip}   监听 :{}   等手机扫码(最多 180s)…\n", pair::NOTIFY_PORT);
+
+        let notify = pair::wait_for_phone(pair::NOTIFY_PORT, Duration::from_secs(180)).await?;
+        println!(
+            "✅ 手机已回投: {} (phoneIp={}, bleId={}, {})",
+            notify.device_name, notify.phone_ip, notify.ble_id, notify.device_type
+        );
+        let data_ip = notify.phone_ip.clone();
+        let pc_ip = local_ip_toward(&data_ip).unwrap_or(lip);
+        return Ok(Transport {
+            data_ip: data_ip.clone(),
+            token,
+            pc_ip,
+            bind_addr: "0.0.0.0".into(),
+            connect_type: "WLAN".into(),
+            vdfs_fetch_host: data_ip,
+            vdfs_fetch_port: 5678,
+            usb_adb: None,
+            _reg: None,
+        });
+    }
     if args.usb {
         tracing::info!(feature, "USB (adb) mode");
         let session = usb::prepare(UsbConfig::default()).await?;
@@ -269,6 +320,70 @@ fn local_ip_toward(peer: &str) -> Option<String> {
     sock.connect((peer, 9)).ok()?; // discard service; no traffic sent
     Some(sock.local_addr().ok()?.ip().to_string())
 }
+
+/// This machine's LAN IPv4 (en0/en1/en2), skipping Tailscale (100.x). macOS path via
+/// `ipconfig getifaddr`; falls back to the route toward a private LAN address.
+fn local_lan_ip() -> Option<String> {
+    for iface in ["en0", "en1", "en2"] {
+        if let Ok(out) = std::process::Command::new("ipconfig")
+            .args(["getifaddr", iface])
+            .output()
+        {
+            let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !ip.is_empty() && !ip.starts_with("100.") {
+                return Some(ip);
+            }
+        }
+    }
+    local_ip_toward("192.168.0.1").filter(|ip| !ip.starts_with("100."))
+}
+
+/// Render the pairing QR for scanning (best-effort). On macOS, generate a PNG via
+/// CoreImage (`swift`) and open it in Preview; the caller always prints the URL too,
+/// so a headless box can still turn it into a QR by hand.
+fn render_qr(url: &str) {
+    if let Err(e) = render_qr_macos(url) {
+        tracing::debug!(err = %e, "QR PNG render unavailable — scan the URL above");
+    }
+}
+
+fn render_qr_macos(url: &str) -> Result<()> {
+    let dir = std::env::temp_dir();
+    let swift = dir.join("pcsuite_qrgen.swift");
+    let png = dir.join("pcsuite_pair_qr.png");
+    std::fs::write(&swift, QRGEN_SWIFT)?;
+    let out = std::process::Command::new("swift")
+        .arg(&swift)
+        .arg(url)
+        .arg(&png)
+        .output()
+        .context("run swift (needs Xcode CLT) to render QR")?;
+    if !out.status.success() {
+        anyhow::bail!("qrgen: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let _ = std::process::Command::new("open").arg(&png).status();
+    println!("    🟦 QR 已生成并打开预览: {}", png.display());
+    Ok(())
+}
+
+/// Offline CoreImage QR generator (mirrors `re/lan/qrgen.swift`). Embedded so the CLI
+/// has no extra crate dependency for QR rendering.
+const QRGEN_SWIFT: &str = r#"import Foundation
+import CoreImage
+import AppKit
+let args = CommandLine.arguments
+guard args.count >= 3 else { exit(2) }
+guard let f = CIFilter(name: "CIQRCodeGenerator") else { exit(3) }
+f.setValue(args[1].data(using: .utf8)!, forKey: "inputMessage")
+f.setValue("M", forKey: "inputCorrectionLevel")
+guard let base = f.outputImage else { exit(4) }
+let img = base.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
+let ctx = CIContext()
+guard let cg = ctx.createCGImage(img, from: img.extent) else { exit(5) }
+let rep = NSBitmapImageRep(cgImage: cg)
+guard let png = rep.representation(using: .png, properties: [:]) else { exit(6) }
+try! png.write(to: URL(fileURLWithPath: args[2]))
+"#;
 
 async fn cmd_screen(args: Args) -> Result<()> {
     let t = resolve_transport(&args, "screen").await?;
@@ -606,6 +721,9 @@ async fn cmd_info(args: Args) -> Result<()> {
     );
     if !info.vivo_account.is_empty() {
         println!("   账号 {}", info.vivo_account);
+    }
+    if !info.open_id.is_empty() {
+        println!("   openId {}", info.open_id);
     }
     Ok(())
 }
