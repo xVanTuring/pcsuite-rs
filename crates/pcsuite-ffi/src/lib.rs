@@ -103,7 +103,10 @@ mod ffi {
         // Fetch phone device facts (storage capacity, model, OS) via the 10380
         // /base-info gateway. Returns tab-separated fields, in order:
         //   name, brand, product, androidVersion, osVersion, widthPx, heightPx,
-        //   fold(0/1), totalStorageGb, availableStorageGb, availableBytes, account
+        //   fold(0/1), totalStorageGb, availableStorageGb, availableBytes, account,
+        //   openId, mobileDeviceId
+        // The trailing mobileDeviceId is the phone's stable unique device id (the
+        // value /base-info routes on), so the app can key a per-device roster on it.
         // Blocking (one HTTP round-trip) — call off the main thread.
         fn device_info(&self) -> Result<String, String>;
 
@@ -494,7 +497,7 @@ impl PcSession {
             .block_on(pcsuite_core::device::fetch(&self.data_ip, &self.token, &device_id))
             .map_err(|e| format!("{e:#}"))?;
         Ok(format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             info.mobile_device_name,
             info.mobile_brand,
             info.product,
@@ -508,6 +511,7 @@ impl PcSession {
             info.available_bytes,
             info.vivo_account,
             info.open_id,
+            device_id,
         ))
     }
 
