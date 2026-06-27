@@ -53,7 +53,7 @@ void* __swift_bridge__$PcScreen$next_frame(void* self);
 void __swift_bridge__$PcScreen$stop(void* self);
 void* __swift_bridge__$PcScreen$next_privacy_event(void* self);
 void* __swift_bridge__$PcScreen$next_input_cursor(void* self);
-struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$start_screen(void* self, int64_t max_size);
+struct __private__ResultPtrAndPtr __swift_bridge__$PcSession$start_screen(void* self, int64_t max_size, int64_t bit_rate, int64_t frame_rate, bool audio);
 void* __swift_bridge__$PcSession$enable_clipboard(void* self, bool recv, bool send);
 void __swift_bridge__$PcSession$stop_clipboard(void* self);
 void __swift_bridge__$PcSession$enable_verify(void* self);

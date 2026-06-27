@@ -299,7 +299,8 @@ impl Session {
         tracing::info!("mirror WS 101; SCREEN_START sent");
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-        let mut tasks = vec![tokio::spawn(crate::screen::video_loop(video, tx))];
+        let mut tasks =
+            vec![tokio::spawn(crate::screen::video_loop(video, tx, self.data_ip.clone()))];
 
         let (input, events, cursor) = match open_ws(
             &self.data_ip,

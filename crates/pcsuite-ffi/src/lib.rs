@@ -67,8 +67,18 @@ mod ffi {
         // Start screen mirroring; returns a PcScreen to poll. Also arms input.
         // `max_size` caps the longer screen edge (px): lower = lower resolution =
         // less encode/decode latency. Pass 0 for the full-resolution default.
+        // `bit_rate` (bps) and `frame_rate` (fps) override the encoder; pass 0 to
+        // let the phone pick its own default. `audio` requests the phone's audio
+        // stream (no_audio=false) — the bytes are demuxed off the video path but
+        // not yet decoded/played (see AudioProbe).
         // Drop the PcScreen (or call stop()) to stop mirroring.
-        fn start_screen(&self, max_size: i64) -> Result<PcScreen, String>;
+        fn start_screen(
+            &self,
+            max_size: i64,
+            bit_rate: i64,
+            frame_rate: i64,
+            audio: bool,
+        ) -> Result<PcScreen, String>;
         // Enable clipboard sync (text + images), built-in macOS backend. Direction:
         // recv = apply the phone's clipboard to this Mac (phone→PC); send = push this
         // Mac's clipboard to the phone (PC→phone). Pass both true for bidirectional.
@@ -332,11 +342,24 @@ impl PcScreen {
 }
 
 impl PcSession {
-    fn start_screen(&self, max_size: i64) -> Result<PcScreen, String> {
+    fn start_screen(
+        &self,
+        max_size: i64,
+        bit_rate: i64,
+        frame_rate: i64,
+        audio: bool,
+    ) -> Result<PcScreen, String> {
         let mut params = ScreenParams::default();
         if max_size > 0 {
             params.max_size = max_size;
         }
+        if bit_rate > 0 {
+            params.bit_rate = bit_rate;
+        }
+        if frame_rate > 0 {
+            params.frame_rate = frame_rate;
+        }
+        params.no_audio = !audio;
         let mut stream = rt()
             .block_on(async {
                 let mut s = self.session.lock().await;

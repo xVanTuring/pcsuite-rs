@@ -26,6 +26,18 @@ pub struct ScreenParams {
     pub show_touch_spot: bool,
     pub split_frame: bool,
     pub support_drag: bool,
+    /// Encoder bitrate override (bps). The phone falls back to its own default
+    /// (~4 Mbps) when this field is absent — so we omit it on the wire when 0,
+    /// keeping the default `SCREEN_START` byte-identical to the official client.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub bit_rate: i64,
+    /// Encoder frame-rate cap (fps). Omitted when 0 (phone picks its default).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub frame_rate: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 impl Default for ScreenParams {
@@ -45,6 +57,8 @@ impl Default for ScreenParams {
             show_touch_spot: false,
             split_frame: false,
             support_drag: true,
+            bit_rate: 0,
+            frame_rate: 0,
         }
     }
 }
@@ -76,6 +90,18 @@ pub fn strip_frame_prefix(payload: &[u8]) -> &[u8] {
     } else {
         payload
     }
+}
+
+/// Does this binary mirror message carry a video frame? When `no_audio:false` the
+/// phone interleaves non-video (audio) packets on the same WS; feeding those to the
+/// HEVC decoder would corrupt the picture, so the data plane must demux. Video is
+/// either `FRAME:`-prefixed or a bare Annex-B unit (NAL start code); anything else
+/// (e.g. AAC/Opus audio) is treated as non-video.
+pub fn is_video_frame(payload: &[u8]) -> bool {
+    if payload.len() >= FRAME_PREFIX.len() && &payload[..FRAME_PREFIX.len()] == FRAME_PREFIX {
+        return true;
+    }
+    payload.starts_with(&[0, 0, 0, 1]) || payload.starts_with(&[0, 0, 1])
 }
 
 /// Privacy / secure-screen state the phone reports via `NOTIFY_PASS:`. When the

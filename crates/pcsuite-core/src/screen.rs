@@ -209,7 +209,7 @@ impl Screen {
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
         let control = tokio::spawn(control_loop(control));
-        let video = tokio::spawn(video_loop(video, tx));
+        let video = tokio::spawn(video_loop(video, tx, data_ip.to_string()));
 
         Ok(Screen {
             frames: rx,
@@ -268,15 +268,226 @@ async fn control_loop(mut ws: WsClient<Tls>) {
     }
 }
 
+/// Per-second wire-level mirror diagnostics, measured at the WS read — *before* the
+/// channel, FFI, and decode — so the numbers reflect the **transport** (the USB vs
+/// LAN comparison) rather than PC-side decode cost. Emits one line per second at
+/// `target: "mirror_stats"`, plus a cumulative `kind=summary` line when the stream
+/// ends.
+///
+/// - `gap` — inter-arrival time between consecutive frames (the felt smoothness; a
+///   high p95/max means stalls, high `jitter` means uneven delivery).
+/// - `backlog` — frames still unread in the channel right after a send. A direct
+///   buffering-latency proxy: a persistently non-zero backlog means frames arrive
+///   faster than they drain, i.e. lag that grows over time (classic on a saturated
+///   LAN link; ~always 0 on USB).
+struct MirrorStats {
+    tag: String,
+    started: Instant,
+    window_start: Instant,
+    last_frame: Option<Instant>,
+    // current 1s window
+    gaps: Vec<f64>,
+    bytes: u64,
+    frames: u64,
+    backlog_max: usize,
+    // cumulative (whole stream)
+    all_gaps: Vec<f64>,
+    total_bytes: u64,
+    total_frames: u64,
+    backlog_peak: usize,
+}
+
+impl MirrorStats {
+    fn new(tag: String) -> Self {
+        let now = Instant::now();
+        Self {
+            tag,
+            started: now,
+            window_start: now,
+            last_frame: None,
+            gaps: Vec::new(),
+            bytes: 0,
+            frames: 0,
+            backlog_max: 0,
+            all_gaps: Vec::new(),
+            total_bytes: 0,
+            total_frames: 0,
+            backlog_peak: 0,
+        }
+    }
+
+    /// Record one arrived frame: its inter-arrival gap and payload size.
+    fn record_frame(&mut self, len: usize) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_frame {
+            let gap = now.duration_since(prev).as_secs_f64() * 1000.0;
+            self.gaps.push(gap);
+            // Bounded so an hours-long session can't grow without limit: past the cap
+            // we keep counting frames/bytes but freeze the percentile sample.
+            if self.all_gaps.len() < 300_000 {
+                self.all_gaps.push(gap);
+            }
+        }
+        self.last_frame = Some(now);
+        self.frames += 1;
+        self.total_frames += 1;
+        self.bytes += len as u64;
+        self.total_bytes += len as u64;
+    }
+
+    /// Fold in the post-send backlog and flush a 1s line once the window elapses.
+    fn tick(&mut self, backlog: usize) {
+        self.backlog_max = self.backlog_max.max(backlog);
+        self.backlog_peak = self.backlog_peak.max(backlog);
+        let elapsed = self.window_start.elapsed().as_secs_f64();
+        if elapsed < 1.0 {
+            return;
+        }
+        let mut gaps = std::mem::take(&mut self.gaps);
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let avg = mean(&gaps);
+        tracing::info!(
+            target: "mirror_stats",
+            tag = %self.tag,
+            fps = r1(self.frames as f64 / elapsed),
+            gap_mean_ms = r1(avg),
+            gap_p95_ms = r1(percentile(&gaps, 95.0)),
+            gap_max_ms = r1(gaps.last().copied().unwrap_or(0.0)),
+            jitter_ms = r1(stddev(&gaps, avg)),
+            kbit_frame = r1(avg_frame_kbit(self.bytes, self.frames)),
+            mbps = r2(self.bytes as f64 * 8.0 / elapsed / 1.0e6),
+            backlog_max = self.backlog_max,
+            "mirror wire (1s)"
+        );
+        self.window_start = Instant::now();
+        self.frames = 0;
+        self.bytes = 0;
+        self.backlog_max = 0;
+    }
+
+    /// Emit a cumulative summary for the whole stream (run once, on end).
+    fn summary(&self) {
+        if self.total_frames == 0 {
+            return;
+        }
+        let secs = self.started.elapsed().as_secs_f64().max(0.001);
+        let mut gaps = self.all_gaps.clone();
+        gaps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        tracing::info!(
+            target: "mirror_stats",
+            tag = %self.tag,
+            kind = "summary",
+            secs = r1(secs),
+            frames = self.total_frames,
+            fps_avg = r1(self.total_frames as f64 / secs),
+            mbps_avg = r2(self.total_bytes as f64 * 8.0 / secs / 1.0e6),
+            gap_p50_ms = r1(percentile(&gaps, 50.0)),
+            gap_p95_ms = r1(percentile(&gaps, 95.0)),
+            gap_p99_ms = r1(percentile(&gaps, 99.0)),
+            gap_max_ms = r1(gaps.last().copied().unwrap_or(0.0)),
+            backlog_peak = self.backlog_peak,
+            "mirror wire summary"
+        );
+    }
+}
+
+fn mean(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        0.0
+    } else {
+        xs.iter().sum::<f64>() / xs.len() as f64
+    }
+}
+
+fn stddev(xs: &[f64], mean: f64) -> f64 {
+    if xs.len() < 2 {
+        return 0.0;
+    }
+    let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / xs.len() as f64;
+    var.sqrt()
+}
+
+/// Nearest-rank percentile; `sorted` must be ascending.
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+fn avg_frame_kbit(bytes: u64, frames: u64) -> f64 {
+    if frames == 0 {
+        0.0
+    } else {
+        bytes as f64 * 8.0 / frames as f64 / 1000.0
+    }
+}
+
+fn r1(x: f64) -> f64 {
+    (x * 10.0).round() / 10.0
+}
+fn r2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
+}
+
+/// Inspects non-video binaries on the mirror WS (the audio packets the phone
+/// interleaves when `no_audio:false`). Audio isn't decoded yet — this logs the wire
+/// shape (size + a head sample) so the codec/framing can be reverse-engineered,
+/// while [`video_loop`] keeps these bytes out of the HEVC decoder.
+#[derive(Default)]
+struct AudioProbe {
+    packets: u64,
+}
+
+impl AudioProbe {
+    fn observe(&mut self, b: &[u8]) {
+        self.packets += 1;
+        // First packet (identify codec/framing) then a light heartbeat — don't spam.
+        if self.packets == 1 || self.packets % 200 == 0 {
+            let head = b
+                .iter()
+                .take(16)
+                .map(|x| format!("{x:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            tracing::info!(
+                target: "mirror_stats",
+                kind = "audio_probe",
+                packets = self.packets,
+                len = b.len(),
+                head = %head,
+                "non-video binary on mirror WS (audio? — not decoded)"
+            );
+        }
+    }
+}
+
 /// Read mirror frames, strip the optional `FRAME:` prefix, push to the channel.
-pub(crate) async fn video_loop(mut ws: WsClient<Tls>, tx: mpsc::Sender<Vec<u8>>) {
+///
+/// `tag` labels the [`MirrorStats`] lines: we pass the data IP, which distinguishes
+/// a USB adb-forward loopback from a LAN phone IP in a combined capture.
+pub(crate) async fn video_loop(mut ws: WsClient<Tls>, tx: mpsc::Sender<Vec<u8>>, tag: String) {
+    let mut stats = MirrorStats::new(tag);
+    let mut audio = AudioProbe::default();
     loop {
         match ws.recv().await {
             Ok(WsFrame::Binary(b)) => {
+                if !screen::is_video_frame(&b) {
+                    // Non-video binary — audio packets arrive here when no_audio=false.
+                    // We don't decode audio yet; record the shape for RE and, crucially,
+                    // keep it out of the HEVC decoder (feeding it would corrupt video).
+                    audio.observe(&b);
+                    continue;
+                }
                 let frame = screen::strip_frame_prefix(&b).to_vec();
+                stats.record_frame(frame.len());
                 if tx.send(frame).await.is_err() {
                     break; // receiver dropped
                 }
+                // Frames still queued, unread by the consumer — buffering latency.
+                let backlog = tx.max_capacity().saturating_sub(tx.capacity());
+                stats.tick(backlog);
             }
             Ok(WsFrame::Ping(p)) => {
                 if ws.send_pong(&p).await.is_err() {
@@ -287,6 +498,7 @@ pub(crate) async fn video_loop(mut ws: WsClient<Tls>, tx: mpsc::Sender<Vec<u8>>)
             Ok(_) => {}
         }
     }
+    stats.summary();
 }
 
 /// Read the `/mirror/control` channel: forward parsed `NOTIFY_PASS` privacy

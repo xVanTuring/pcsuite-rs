@@ -141,8 +141,8 @@ public class PcSessionRef {
     }
 }
 extension PcSessionRef {
-    public func start_screen(_ max_size: Int64) throws -> PcScreen {
-        try { let val = __swift_bridge__$PcSession$start_screen(ptr, max_size); if val.is_ok { return PcScreen(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
+    public func start_screen(_ max_size: Int64, _ bit_rate: Int64, _ frame_rate: Int64, _ audio: Bool) throws -> PcScreen {
+        try { let val = __swift_bridge__$PcSession$start_screen(ptr, max_size, bit_rate, frame_rate, audio); if val.is_ok { return PcScreen(ptr: val.ok_or_err!) } else { throw RustString(ptr: val.ok_or_err!) } }()
     }
 
     public func enable_clipboard(_ recv: Bool, _ send: Bool) throws -> () {
